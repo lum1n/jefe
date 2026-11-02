@@ -23,8 +23,11 @@ pub enum Input {
         stderr: String,
     },
     /// Bytes a worker's log gained, from the offset of its [`Effect::Follow`].
+    /// Serialized as a string when they are UTF-8 (logs are NDJSON), else as
+    /// an array of numbers.
     Bytes {
         worker: WorkerId,
+        #[serde(with = "text_or_bytes")]
         bytes: Vec<u8>,
     },
     /// A worker's log ended: the harness exited.
@@ -117,4 +120,57 @@ pub enum Purpose {
     Discard(WorkerId),
     Kill(WorkerId),
     Remove(WorkerId),
+}
+
+/// Log bytes as a JSON string when they are valid UTF-8, which they are
+/// unless a chunk splits a character; an array of numbers otherwise.
+mod text_or_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => s.serialize_str(text),
+            Err(_) => s.collect_seq(bytes),
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Ok(match Repr::deserialize(d)? {
+            Repr::Text(t) => t.into_bytes(),
+            Repr::Bytes(b) => b,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn bytes_are_text_when_they_can_be() {
+        let worker = WorkerId("w".to_owned());
+        for bytes in [b"{\"a\":1}\n".to_vec(), vec![0xe2, 0x82]] {
+            let input = Input::Bytes {
+                worker: worker.clone(),
+                bytes,
+            };
+            let json = serde_json::to_string(&input).unwrap();
+            assert_eq!(serde_json::from_str::<Input>(&json).unwrap(), input);
+        }
+        let json = serde_json::to_string(&Input::Bytes {
+            worker,
+            bytes: b"hi".to_vec(),
+        })
+        .unwrap();
+        assert!(json.contains("\"bytes\":\"hi\""), "{json}");
+    }
 }

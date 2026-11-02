@@ -6,3 +6,5 @@
 - `jefe capabilities [--json]`.
 - jefe-core: the supervision loop (`Jefe::new/step/snapshot/restore`) over jobs, tasks and workers on acc sessions; preflight of the repository; worktree per worker; policy-held approvals with unmatched ones denied; questions, errors, exits, stalls, quota and auth routed to the brain; result blocks (`jefe-result`) with one nudge when missing; diff review; sequential merges with conflicts turned into resolve tasks; respawn and handoff; wall-clock limit; cancel keeps branches.
 - jefe-core: the `Brain` interface with a bounded action set, `rules::allowed`/`validate` (refused decisions are retried once, then the rules decide), `RulesBrain`, and the chief prompt and `jefe-decision` parser.
+- `jefe "<goal>"`, `status`, `jobs`, `attach`, `stop` and `config example|check`: one local host, the rules brain, prose or `--json` output, stdin answers and control, Ctrl-C/SIGTERM cancel, `jefe.toml`, and job state under `~/.local/state/jefe/jobs/<id>/`. `attach` restores the workers' acc sessions after jefe dies.
+- `Input::Bytes` serializes as a string when the bytes are UTF-8.
