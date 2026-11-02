@@ -18,11 +18,15 @@ jefe jobs [--json]
 jefe attach JOB                        # resume a job whose jefe process died
 jefe stop JOB                          # cancel, keeping branches
 jefe config example                    # every setting with its default
+jefe config check [--config FILE]      # load the config and report problems
+jefe capabilities [--json]             # protocol version, harnesses, brains
 ```
 
 While it runs, type an answer when it asks (a number picks an option) or `q` to cancel. In `--json` mode stdin takes `{"cmd":"answer","text":".."}`, `{"cmd":"nudge","text":".."}`, `{"cmd":"cancel"}` and `{"cmd":"status"}`.
 
-Exit codes: 0 done, 1 jefe failed (bad input, config, unreachable host), 2 failed or gave up, 3 cancelled.
+Other run flags: `--base <branch>`, `--harness`, `--brain-harness`, `--workers N`, `--no-review`, `--allow-dirty`, `--id`, `--config`. `jefe run "..."` is the same as `jefe "..."`.
+
+Exit codes: 0 done, 1 jefe failed (bad input, config, unreachable host), 2 failed or gave up, 3 cancelled, 4 the job stopped while still planning, running or waiting for a human.
 
 With `--host <name>`, the workers, the brain and the merges run on a host from `[hosts.<name>]` in the config. jefe reaches it over SSH, using the SSH agent or an unencrypted `identity` file, and checks its key against `~/.ssh/known_hosts` or pinned `fingerprints`. Nothing needs to be installed there except git and the harness. `--repo` is then an absolute path on that host.
 
