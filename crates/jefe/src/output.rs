@@ -108,13 +108,17 @@ impl Output {
             Mode::Prose => self.line(report_md(report).trim_end()),
         }
     }
+}
 
-    pub fn error(&self, code: &str, message: &str) {
-        match self.mode {
-            Mode::Json => self.json(&json!({ "type": "error", "code": code, "message": message })),
-            Mode::Prose => eprintln!("jefe: {message}"),
-        }
-    }
+/// `{"type":"error",...}` on stdout, and the message on stderr. Codes:
+/// `bad_control` (a control line was ignored; the job goes on) and `fatal`
+/// (jefe stops without a `bye`).
+pub fn json_error(code: &str, message: &str) {
+    eprintln!("jefe: {message}");
+    let line = json!({ "type": "error", "code": code, "message": message });
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// `jefe-<job>-w1` → `w1`.

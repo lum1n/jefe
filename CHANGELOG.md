@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-11-02)
+
+- Protocol version 1 is frozen: [docs/PROTOCOL.md](docs/PROTOCOL.md) lists every envelope, event, trigger, action and control command, and a test fails when one is added without docs. [docs/EMBED.md](docs/EMBED.md) covers the binary, the crate and the sans-IO core.
+- `--json` failures are `{"type":"error","code":"fatal"}` lines, and ignored control lines are `{"type":"error","code":"bad_control"}` (both also on stderr).
+- Fix: jefe no longer hangs after `bye` when its stdin is still open.
 
 - Workspace with `jefe-core` (sans-IO) and `jefe` (host and binary), on acc 22f3466.
 - `jefe capabilities [--json]`.

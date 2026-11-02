@@ -663,3 +663,100 @@ fn a_job_runs_on_an_ssh_host_and_attach_finds_it_again() {
     let log = std::fs::read_to_string(env.root.join("sshd/sshd.log")).unwrap();
     assert!(log.contains("Accepted publickey"), "{log}");
 }
+
+/// Protocol v1 as an embedder sees it: the envelope, every control command,
+/// both error codes, and `capabilities`.
+#[test]
+fn json_mode_speaks_protocol_v1() {
+    use std::io::Write as _;
+
+    let env = Env::new();
+    let caps = env.jefe(&["capabilities", "--json"]);
+    assert_eq!(caps.status.code(), Some(0));
+    let caps: serde_json::Value = serde_json::from_slice(&caps.stdout).unwrap();
+    assert_eq!(caps["type"], "capabilities");
+    assert_eq!(caps["version"], 1);
+    assert!(caps["jefe"].is_string() && caps["acc"].is_string(), "{caps}");
+    assert!(
+        caps["harnesses"].as_array().unwrap().contains(&"claude".into()),
+        "{caps}"
+    );
+    assert_eq!(caps["brains"], serde_json::json!(["rules", "harness"]));
+
+    let bad = env.jefe(&["add hello", "--json", "--repo", "/nonexistent/repo"]);
+    assert_eq!(bad.status.code(), Some(1));
+    let lines = events(&bad.stdout);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["type"], "error");
+    assert_eq!(lines[0]["code"], "fatal");
+    assert!(
+        lines[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/nonexistent/repo")
+    );
+
+    std::fs::write(env.home().join("hold"), "").unwrap();
+    let mut child = env
+        .command(&["add hello", "--json", "--id", "j1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !env.home().join("started").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the worker never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    for line in [
+        r#"{"cmd":"status"}"#,
+        "not json",
+        r#"{"cmd":"nudge","text":"keep it short"}"#,
+        r#"{"cmd":"cancel"}"#,
+    ] {
+        writeln!(stdin, "{line}").unwrap();
+    }
+    stdin.flush().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    let lines = events(&out.stdout);
+
+    let hello = &lines[0];
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["version"], 1);
+    assert_eq!(hello["job"], "j1");
+    assert_eq!(hello["jefe"], caps["jefe"]);
+    assert_eq!(hello["acc"], caps["acc"]);
+    let bye = lines.last().unwrap();
+    assert_eq!(*bye, serde_json::json!({"type": "bye", "status": "cancelled"}));
+
+    let mut seq = 0;
+    for l in &lines {
+        let kind = l["type"].as_str().unwrap();
+        assert!(
+            ["hello", "event", "ask", "snapshot", "error", "bye"].contains(&kind),
+            "unknown envelope {l}"
+        );
+        if kind == "event" {
+            let s = l["seq"].as_u64().unwrap();
+            assert!(s > seq, "seq went from {seq} to {s}");
+            seq = s;
+            assert_eq!(l["job"], "j1");
+            assert!(l["at_ms"].as_u64().unwrap() > 0);
+            assert!(l["event"]["type"].is_string(), "{l}");
+        }
+    }
+    let snapshot = lines.iter().find(|l| l["type"] == "snapshot").unwrap();
+    assert_eq!(snapshot["job"]["id"], "j1");
+    assert_eq!(snapshot["job"]["goal"], "add hello");
+    let error = lines.iter().find(|l| l["type"] == "error").unwrap();
+    assert_eq!(error["code"], "bad_control");
+    let types = event_types(&lines);
+    assert_eq!(types.first().map(String::as_str), Some("job_created"));
+    assert_eq!(types.last().map(String::as_str), Some("job_cancelled"));
+}

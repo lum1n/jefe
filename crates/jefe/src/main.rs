@@ -116,8 +116,13 @@ enum ConfigCmd {
 
 fn main() {
     let cli = Cli::parse();
+    let json = wants_json(&cli);
     let code = match run(cli) {
         Ok(code) => code,
+        Err(e) if json => {
+            jefe::output::json_error("fatal", &format!("{e:#}"));
+            1
+        }
         Err(e) => {
             eprintln!("jefe: {e:#}");
             1
@@ -126,8 +131,29 @@ fn main() {
     std::process::exit(code);
 }
 
-fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)
+/// Whether the command speaks JSON, so its failures do too.
+fn wants_json(cli: &Cli) -> bool {
+    match &cli.command {
+        None => cli.run.json,
+        Some(Command::Run(a)) => a.json,
+        Some(
+            Command::Status { json, .. }
+            | Command::Jobs { json }
+            | Command::Attach { json, .. }
+            | Command::Capabilities { json },
+        ) => *json,
+        Some(Command::Stop { .. } | Command::Config { .. }) => false,
+    }
+}
+
+/// Runs `f` to completion on a fresh runtime. The runtime is then left to
+/// shut down in the background: the stdin reader blocks a thread until EOF,
+/// and an embedder that keeps stdin open must not keep jefe alive.
+fn block_on<F: std::future::Future>(f: F) -> anyhow::Result<F::Output> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let out = rt.block_on(f);
+    rt.shutdown_background();
+    Ok(out)
 }
 
 fn mode(json: bool) -> Mode {
@@ -144,7 +170,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Status { job, json } => status(job, json),
         Command::Jobs { json } => jobs(json),
         Command::Attach { job, json } => {
-            let report = runtime()?.block_on(jefe::resume(&job, mode(json), true, false))?;
+            let report = block_on(jefe::resume(&job, mode(json), true, false))??;
             Ok(jefe::output::exit_code(report.status))
         }
         Command::Stop { job } => stop(&job),
@@ -247,7 +273,7 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         timeout_ms: spec.budget.brain_timeout_ms,
         prompts: spec.prompts.clone(),
     });
-    let report = runtime()?.block_on(jefe::start(spec, host, brain, mode(a.json), attended))?;
+    let report = block_on(jefe::start(spec, host, brain, mode(a.json), attended))??;
     Ok(jefe::output::exit_code(report.status))
 }
 
@@ -337,7 +363,7 @@ fn stop(id: &str) -> anyhow::Result<i32> {
             Ok(0)
         }
         None => {
-            let report = runtime()?.block_on(jefe::resume(id, Mode::Prose, false, true))?;
+            let report = block_on(jefe::resume(id, Mode::Prose, false, true))??;
             Ok(jefe::output::exit_code(report.status))
         }
     }

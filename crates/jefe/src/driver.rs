@@ -284,7 +284,7 @@ impl Supervisor {
                     Mode::Json => match parse_control(line) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!("jefe: bad control line: {e}");
+                            crate::output::json_error("bad_control", &format!("bad control line: {e}"));
                             continue;
                         }
                     },
