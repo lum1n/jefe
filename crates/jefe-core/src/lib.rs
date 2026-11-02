@@ -26,7 +26,7 @@ pub use brain::{Action, ActionKind, Brain, Decision, DecisionSource, RulesBrain,
 pub use event::{Event, Stamped};
 pub use ids::{AskId, ExecId, HostId, JobId, TaskId, WorkerId};
 pub use io::{Effect, HumanReply, Input, Purpose};
-pub use jefe::{Jefe, RestoreError};
+pub use jefe::{Jefe, RESEND_AFTER_MS, RestoreError};
 pub use job::{Budget, JobSpec, JobStatus, Report, TaskStatus, WorkerConfig};
 
 /// Version of the JSON protocol jefe speaks when embedded. Consumers reject

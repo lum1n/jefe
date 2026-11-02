@@ -62,6 +62,10 @@ struct Book {
     next_task: u32,
     next_worker: u32,
     runs: BTreeMap<ExecId, Purpose>,
+    /// What the running [`Purpose::Input`] execs write, so a restart can
+    /// send what may never have arrived.
+    #[serde(default)]
+    inputs: BTreeMap<ExecId, Exec>,
     asks: BTreeMap<AskId, PendingAsk>,
     human: Option<HumanAsk>,
     merge_queue: Vec<TaskId>,
@@ -83,6 +87,10 @@ struct SnapshotDoc {
 }
 
 const SNAPSHOT_VERSION: u32 = 1;
+
+/// After a restart, how long a worker may stay silent before what jefe may
+/// not have finished writing to it is written again.
+pub const RESEND_AFTER_MS: u64 = 30_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
@@ -163,6 +171,7 @@ impl Jefe {
             .iter()
             .filter(|w| matches!(w.phase, WorkerPhase::Working | WorkerPhase::Waiting))
             .map(|w| w.last_progress_ms.saturating_add(b.stall_ms))
+            .chain(self.job.workers.iter().filter_map(|w| w.resend_at))
             .chain([wall])
             .min()
     }
@@ -252,7 +261,7 @@ impl Jefe {
             return Err(RestoreError::Version(doc.v));
         }
         let job: Job = serde_json::from_value(doc.job)?;
-        let lost: Vec<Purpose> = doc.book.runs.values().cloned().collect();
+        let lost: Vec<(ExecId, Purpose)> = doc.book.runs.clone().into_iter().collect();
         let mut j = Self {
             spec: doc.spec,
             job,
@@ -261,6 +270,7 @@ impl Jefe {
             out: Vec::new(),
         };
         j.book.runs.clear();
+        let mut lost_inputs = std::mem::take(&mut j.book.inputs);
         if j.book.finished {
             return Ok((j, Vec::new()));
         }
@@ -276,12 +286,12 @@ impl Jefe {
                         gone.push(w.id.clone());
                     }
                 }
-                None if w.phase == WorkerPhase::Preparing => {}
+                None if w.phase == WorkerPhase::Preparing || w.pending_launch.is_some() => {}
                 None => gone.push(w.id.clone()),
             }
         }
         // Re-run what was in flight where running it twice is harmless.
-        for p in lost {
+        for (id, p) in lost {
             match p {
                 Purpose::Preflight => j.run(
                     Exec::new(merge::preflight_script(&j.job.repo)),
@@ -297,14 +307,45 @@ impl Jefe {
                 Purpose::Discard(w) => j.discard(&w),
                 Purpose::Kill(w) => j.kill(&w),
                 Purpose::Remove(w) => j.remove(&w),
-                Purpose::Launch(_) | Purpose::Input(_) | Purpose::Status(_) | Purpose::SpecWrite(_) => {}
+                // Maybe written, maybe not: send it again unless the worker
+                // shows it got it (see `Worker::unsent`).
+                Purpose::Input(w) => {
+                    let resend_at = j.now.saturating_add(RESEND_AFTER_MS);
+                    if let (Some(exec), Some(worker)) = (lost_inputs.remove(&id), j.job.worker_mut(&w)) {
+                        worker.unsent.push(exec);
+                        worker.resend_at = Some(resend_at);
+                    }
+                }
+                Purpose::Launch(_) | Purpose::Status(_) | Purpose::SpecWrite(_) => {}
+            }
+        }
+        // A replacement waiting for its predecessor's kill: launch it now
+        // unless a re-run kill will.
+        let waiting: Vec<WorkerId> = j
+            .job
+            .workers
+            .iter()
+            .filter(|w| w.pending_launch.is_some())
+            .map(|w| w.id.clone())
+            .collect();
+        for next in waiting {
+            let killing = j.job.workers.iter().any(|old| {
+                old.replaced_by.as_ref() == Some(&next)
+                    && j.book.runs.values().any(|p| *p == Purpose::Kill(old.id.clone()))
+            });
+            if !killing {
+                j.run_pending_launch(&next);
             }
         }
         let live: Vec<WorkerId> = j
             .job
             .workers
             .iter()
-            .filter(|w| w.has_session() && w.is_live())
+            .filter(|w| {
+                w.has_session()
+                    && w.is_live()
+                    && !j.book.runs.values().any(|p| *p == Purpose::Launch(w.id.clone()))
+            })
             .map(|w| w.id.clone())
             .collect();
         for id in live {
@@ -364,6 +405,9 @@ impl Jefe {
         self.book.next_exec += 1;
         let id = ExecId(self.book.next_exec);
         self.book.runs.insert(id, purpose.clone());
+        if matches!(purpose, Purpose::Input(_)) {
+            self.book.inputs.insert(id, exec.clone());
+        }
         self.out.push(Effect::Run {
             id,
             host: self.job.host.clone(),
@@ -404,6 +448,7 @@ impl Jefe {
         let Some(purpose) = self.book.runs.remove(&id) else {
             return;
         };
+        self.book.inputs.remove(&id);
         let err = || {
             let e = stderr.trim();
             if e.is_empty() {
@@ -726,6 +771,11 @@ impl Jefe {
             return;
         };
         let was_replaying = updates.iter().any(|u| u.replay);
+        if updates.iter().any(|u| !u.replay) {
+            // It is talking, so what was written before the restart arrived.
+            worker.unsent.clear();
+            worker.resend_at = None;
+        }
         let obs = worker.observe(updates);
         let caught_up = was_replaying && !worker.is_replaying();
         for o in obs {
@@ -1059,7 +1109,6 @@ impl Jefe {
             return;
         };
         let new_id = self.new_worker_id();
-        let rules = crate::policy::worker_rules(&self.spec.workers.policy);
         let Some(old) = self.job.worker_mut(w) else { return };
         let Some(task) = old.task.clone() else { return };
         // The predecessor is stopped here; acc's replace flag is for clients
@@ -1076,21 +1125,18 @@ impl Jefe {
         next.cwd = old.cwd.clone();
         next.respawns = old.respawns + 1;
         next.turns = old.turns;
+        // Check the request now; the session itself is built at launch.
+        if let Err(e) = Worker::check_launch(&req, self.now) {
+            self.notice(format!("can't restart {w}: {e}"));
+            self.fail_task(&task, format!("restarting failed: {e}"));
+            return;
+        }
         old.replaced_by = Some(new_id.clone());
         let old_alive = old.is_alive();
         let kill = old.kill_exec();
         old.phase = WorkerPhase::Gone;
-        match next.launch(req, rules, self.now) {
-            Ok(exec) => {
-                next.phase = WorkerPhase::Launching;
-                next.pending_launch = Some(exec);
-            }
-            Err(e) => {
-                self.notice(format!("can't restart {w}: {e}"));
-                self.fail_task(&task, format!("restarting failed: {e}"));
-                return;
-            }
-        }
+        next.phase = WorkerPhase::Launching;
+        next.pending_launch = Some(req);
         let harness = next.harness;
         self.job.workers.push(next);
         if let Some(t) = self.job.task_mut(&task) {
@@ -1114,8 +1160,20 @@ impl Jefe {
     }
 
     fn run_pending_launch(&mut self, w: &WorkerId) {
-        let Some(exec) = self.job.worker_mut(w).and_then(|x| x.pending_launch.take()) else {
+        let rules = crate::policy::worker_rules(&self.spec.workers.policy);
+        let now = self.now;
+        let Some(worker) = self.job.worker_mut(w) else {
             return;
+        };
+        let Some(req) = worker.pending_launch.take() else {
+            return;
+        };
+        let exec = match worker.launch(req, rules, now) {
+            Ok(exec) => exec,
+            Err(e) => {
+                self.start_failed(w, format!("can't launch: {e}"));
+                return;
+            }
         };
         let Some(worker) = self.job.worker(w) else { return };
         let (task, harness, branch) = (worker.task.clone(), worker.harness, worker.branch.clone());
@@ -1880,6 +1938,29 @@ impl Jefe {
                 b.wall_ms / 60_000
             ));
             return;
+        }
+        let due: Vec<WorkerId> = self
+            .job
+            .workers
+            .iter()
+            .filter(|w| w.resend_at.is_some_and(|at| at <= self.now))
+            .map(|w| w.id.clone())
+            .collect();
+        for w in due {
+            let Some(worker) = self.job.worker_mut(&w) else {
+                continue;
+            };
+            worker.resend_at = None;
+            let execs = std::mem::take(&mut worker.unsent);
+            if !worker.is_live() || !worker.has_session() {
+                continue;
+            }
+            self.notice(format!(
+                "{w} has been silent since the restart; writing again what may not have reached it"
+            ));
+            for exec in execs {
+                self.run(exec, Purpose::Input(w.clone()));
+            }
         }
         let stalled: Vec<(WorkerId, u64)> = self
             .job

@@ -53,6 +53,9 @@ struct Host {
     human_asks: Vec<String>,
     /// Stop delivering effects (to snapshot mid-job).
     hold_follow: bool,
+    /// Execs to leave running (never answered), to snapshot while they are.
+    hold: fn(&Purpose) -> bool,
+    held: Vec<Purpose>,
 }
 
 fn worker_no(w: &WorkerId) -> u32 {
@@ -80,6 +83,8 @@ impl Host {
             runs: Vec::new(),
             human_asks: Vec::new(),
             hold_follow: false,
+            hold: |_| false,
+            held: Vec::new(),
         }
     }
 
@@ -120,6 +125,10 @@ impl Host {
                     id, exec, purpose, ..
                 } => {
                     self.runs.push(purpose.clone());
+                    if (self.hold)(&purpose) {
+                        self.held.push(purpose);
+                        continue;
+                    }
                     match purpose {
                         Purpose::Preflight => {
                             let out = self.preflight.clone();
@@ -544,5 +553,141 @@ fn a_snapshot_restores_and_the_job_finishes() {
     // The log the worker wrote while jefe was away.
     h.deliver(&WorkerId::from("jefe-j1-w1"));
     h.drain();
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+/// Restores from `h`'s current snapshot with the sessions in `specs`.
+fn restart(h: &mut Host, specs: &[acc_core::session::SessionSpec]) {
+    let snap = h.jefe.snapshot();
+    let (jefe, effects) = Jefe::restore(&snap, specs, h.now).unwrap();
+    h.jefe = jefe;
+    h.queue = effects.into();
+    h.hold = |_| false;
+    h.runs.clear();
+}
+
+fn notices(h: &Host) -> Vec<String> {
+    h.events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Notice { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn w(n: u32) -> WorkerId {
+    WorkerId::from(format!("jefe-j1-w{n}").as_str())
+}
+
+/// jefe died while writing the first prompt: after a silent while it is
+/// written again, and the job goes on.
+#[test]
+fn a_prompt_lost_in_a_restart_is_sent_again() {
+    let mut h = Host::new(spec(), Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.hold = |p| matches!(p, Purpose::Input(_));
+    h.drain();
+    assert_eq!(h.held, [Purpose::Input(w(1))]);
+    let session_spec = h.jefe.job().workers[0].session().unwrap().spec().clone();
+    restart(&mut h, &[session_spec]);
+    h.drain();
+    assert!(
+        !h.runs.contains(&Purpose::Input(w(1))),
+        "sent at once: {:?}",
+        h.runs
+    );
+    let due = h.jefe.next_deadline().unwrap();
+    assert!(
+        due <= h.now + jefe_core::RESEND_AFTER_MS,
+        "deadline {due} is too late"
+    );
+    h.now = due;
+    h.feed(Input::Tick);
+    h.drain();
+    assert!(h.runs.contains(&Purpose::Input(w(1))), "{:?}", h.runs);
+    assert!(notices(&h).iter().any(|n| n.contains("silent since the restart")));
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+/// The prompt did arrive before jefe died: the worker's output shows it,
+/// and nothing is written twice.
+#[test]
+fn a_prompt_that_arrived_is_not_sent_twice() {
+    let mut h = Host::new(spec(), Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.hold = |p| matches!(p, Purpose::Input(_));
+    h.drain();
+    let session_spec = h.jefe.job().workers[0].session().unwrap().spec().clone();
+    restart(&mut h, &[session_spec]);
+    h.drain();
+    h.deliver(&w(1));
+    h.drain();
+    h.now += jefe_core::RESEND_AFTER_MS * 2;
+    h.feed(Input::Tick);
+    h.drain();
+    assert!(!h.runs.contains(&Purpose::Input(w(1))), "{:?}", h.runs);
+    assert!(!notices(&h).iter().any(|n| n.contains("silent since the restart")));
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+/// Respawns a stalled worker; the rules decide everything else.
+struct RespawnOnStall;
+
+impl Brain for RespawnOnStall {
+    fn decide(&mut self, s: &Situation) -> Decision {
+        match &s.trigger {
+            jefe_core::Trigger::Stalled { worker } => Decision {
+                action: Action::Respawn {
+                    worker: worker.clone(),
+                },
+                rationale: "scripted".to_owned(),
+                confidence: 0.9,
+                source: DecisionSource::Brain {
+                    harness: None,
+                    model: None,
+                },
+            },
+            _ => RulesBrain.decide(s),
+        }
+    }
+}
+
+/// A job whose stalled w1 is being replaced by w2, with w1's kill still
+/// running. Returns w1's session spec.
+fn replacing_a_stalled_worker() -> (Host, acc_core::session::SessionSpec) {
+    let mut s = spec();
+    s.budget.stall_ms = 1_000;
+    let mut h = Host::new(s, Box::new(RespawnOnStall)).script(2, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    let old_spec = h.jefe.job().workers[0].session().unwrap().spec().clone();
+    h.hold = |p| matches!(p, Purpose::Kill(_));
+    h.now += 5_000;
+    h.feed(Input::Tick);
+    h.drain();
+    assert_eq!(h.held, [Purpose::Kill(w(1))], "{:?}", h.kinds());
+    assert!(h.jefe.job().workers[1].pending_launch.is_some());
+    (h, old_spec)
+}
+
+/// jefe died while a respawn waited for the old worker to stop: the stop
+/// runs again and the replacement still launches.
+#[test]
+fn a_replacement_waiting_on_a_kill_survives_a_restart() {
+    let (mut h, old_spec) = replacing_a_stalled_worker();
+    restart(&mut h, &[old_spec]);
+    h.drain();
+    let launches = h.runs.iter().filter(|p| **p == Purpose::Launch(w(2))).count();
+    assert!(h.runs.contains(&Purpose::Kill(w(1))), "{:?}", h.runs);
+    assert_eq!(launches, 1, "{:?}", h.runs);
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+/// The same, when the old worker's session is gone too: nothing is left
+/// to stop, so the replacement launches straight away.
+#[test]
+fn a_replacement_launches_when_its_predecessor_is_gone() {
+    let (mut h, _) = replacing_a_stalled_worker();
+    restart(&mut h, &[]);
+    h.drain();
+    assert!(h.runs.contains(&Purpose::Launch(w(2))), "{:?}", h.runs);
     assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
 }

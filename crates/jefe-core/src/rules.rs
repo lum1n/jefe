@@ -29,7 +29,7 @@ fn base(trigger: &Trigger) -> &'static [ActionKind] {
         Trigger::WorkerError { .. } => &[Prompt, Respawn, Handoff, GiveUpTask, GiveUp],
         Trigger::Exited { .. } => &[Respawn, Handoff, GiveUpTask, GiveUp],
         Trigger::Auth { .. } => &[AskHuman, Handoff, GiveUpTask, GiveUp],
-        Trigger::Stalled { .. } => &[Wait, Interrupt, Prompt, GiveUpTask],
+        Trigger::Stalled { .. } => &[Wait, Interrupt, Prompt, Respawn, Handoff, GiveUpTask],
         Trigger::Quota { .. } => &[Handoff, Wait, GiveUpTask],
         Trigger::Wrap => &[Done, Plan, GiveUp],
     }

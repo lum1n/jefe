@@ -106,8 +106,16 @@ pub struct Worker {
     pub discarded: bool,
     /// Requests it raised that jefe already dealt with.
     pub handled: Vec<String>,
-    /// The launch to run once its predecessor has stopped.
-    pub pending_launch: Option<Exec>,
+    /// The launch to make once its predecessor has stopped. Kept as a
+    /// request, not an exec: the session is only built when it launches, so
+    /// a restart in between loses nothing.
+    pub pending_launch: Option<LaunchRequest>,
+    /// Writes that were running when jefe stopped, sent again at
+    /// `resend_at` unless the worker shows signs of life first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsent: Vec<Exec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resend_at: Option<u64>,
     /// [`Session::snapshot`] as of the job's last snapshot.
     pub session_snapshot: Option<String>,
     #[serde(skip)]
@@ -145,6 +153,8 @@ impl Worker {
             discarded: false,
             handled: Vec::new(),
             pending_launch: None,
+            unsent: Vec::new(),
+            resend_at: None,
             session_snapshot: None,
             session: None,
         }
@@ -176,6 +186,11 @@ impl Worker {
         self.harness = session.harness();
         self.session = Some(session);
         Ok(exec)
+    }
+
+    /// Whether `req` would launch, without keeping anything.
+    pub fn check_launch(req: &LaunchRequest, now_ms: u64) -> Result<(), SessionError> {
+        Session::launch(req.clone(), "jefe-check", CLIENT_TAG, now_ms).map(drop)
     }
 
     /// Picks its session up again after a restart, from the snapshot if it
