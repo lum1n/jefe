@@ -1,5 +1,6 @@
 //! `jefe.toml`: every field has a default, unknown fields are errors.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use acc_core::Harness;
@@ -10,6 +11,8 @@ use anyhow::Context as _;
 use jefe_core::{Budget, WorkerConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::{HostConfig, JobHost};
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -18,6 +21,8 @@ pub struct Config {
     pub limits: Limits,
     pub review: Review,
     pub merge: Merge,
+    /// SSH hosts for `--host <name>`.
+    pub hosts: BTreeMap<String, HostConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,6 +188,16 @@ max_diff_chars = 60000
 
 [merge]
 squash = false
+
+# Hosts for `--host <name>`, reached over SSH. `local` is this machine.
+# [hosts.box]
+# host = "box.example.com"
+# user = "me"                  # default: $USER
+# port = 22
+# identity = "~/.ssh/id_ed25519" # an unencrypted key; default: the SSH agent
+# known_hosts = "~/.ssh/known_hosts"   # the default, or:
+# fingerprints = ["SHA256:..."]
+# connect_timeout_secs = 10
 "#;
 
 impl Config {
@@ -196,7 +211,34 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        for (name, h) in &config.hosts {
+            if name == "local" {
+                anyhow::bail!("[hosts.local]: `local` is this machine and can't be configured");
+            }
+            if !jefe_core::ids::valid_job_id(name) {
+                anyhow::bail!("[hosts.{name}]: use letters, digits, '-' or '_' in host names");
+            }
+            h.check().with_context(|| format!("[hosts.{name}]"))?;
+        }
+        Ok(config)
+    }
+
+    /// The host named `name` (`None` or `local`: this machine).
+    pub fn job_host(&self, name: Option<&str>) -> anyhow::Result<JobHost> {
+        match name {
+            None | Some("local") => Ok(JobHost::local()),
+            Some(n) => {
+                let ssh = self.hosts.get(n).cloned().ok_or_else(|| {
+                    let known: Vec<&str> = self.hosts.keys().map(String::as_str).collect();
+                    anyhow::anyhow!("no [hosts.{n}] in the config (known: local {})", known.join(" "))
+                })?;
+                Ok(JobHost {
+                    name: jefe_core::HostId(n.to_owned()),
+                    ssh: Some(ssh),
+                })
+            }
+        }
     }
 
     pub fn worker_config(&self) -> WorkerConfig {
@@ -244,6 +286,19 @@ mod tests {
     fn unknown_fields_are_errors() {
         assert!(Config::parse("[workers]\nharnes = \"claude\"\n").is_err());
         assert!(Config::parse("[nope]\n").is_err());
+    }
+
+    #[test]
+    fn hosts_are_looked_up_by_name() {
+        let c = Config::parse("[hosts.box]\nhost = \"10.0.0.2\"\nport = 2200\n").unwrap();
+        assert!(c.job_host(None).unwrap().is_local());
+        assert!(c.job_host(Some("local")).unwrap().is_local());
+        let h = c.job_host(Some("box")).unwrap();
+        assert_eq!(h.name.as_str(), "box");
+        assert_eq!(h.ssh.unwrap().port, 2200);
+        assert!(c.job_host(Some("nope")).is_err());
+        assert!(Config::parse("[hosts.local]\nhost = \"x\"\n").is_err());
+        assert!(Config::parse("[hosts.box]\nhost = \"x\"\nnope = 1\n").is_err());
     }
 
     #[test]

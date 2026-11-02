@@ -1,6 +1,6 @@
 //! A job's directory: `job.json` (the latest snapshot), `events.ndjson`,
 //! `inputs.ndjson` (everything fed to the loop, for replay), `report.md`,
-//! and `pid` while a jefe process drives it.
+//! `brain.json`, `host.json`, and `pid` while a jefe process drives it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -81,6 +81,14 @@ impl Store {
         )
     }
 
+    /// Which host the job runs on, for `attach`.
+    pub fn save_host(&self, host: &crate::hosts::JobHost) -> anyhow::Result<()> {
+        write_atomic(
+            &self.dir.join("host.json"),
+            serde_json::to_string(host)?.as_bytes(),
+        )
+    }
+
     /// Gives the job up: another process may drive it now.
     pub fn release(&self) {
         let _ = fs::remove_file(self.dir.join("pid"));
@@ -112,6 +120,15 @@ pub fn load_brain(id: &str) -> anyhow::Result<Option<crate::brain::HarnessBrain>
     match fs::read_to_string(Store::dir_for(id).join("brain.json")) {
         Ok(text) => Ok(serde_json::from_str(&text)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The host job `id` runs on; this machine when it never saved one.
+pub fn load_host(id: &str) -> anyhow::Result<crate::hosts::JobHost> {
+    match fs::read_to_string(Store::dir_for(id).join("host.json")) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::hosts::JobHost::local()),
         Err(e) => Err(e.into()),
     }
 }

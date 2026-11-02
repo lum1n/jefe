@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use jefe::config::{BrainKind, Config};
 use jefe::{HarnessBrain, Mode, store};
-use jefe_core::{HostId, JobId, JobSpec};
+use jefe_core::{JobId, JobSpec};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,9 +29,13 @@ struct RunArgs {
     /// What to get done.
     #[arg(required = true)]
     goal: Option<String>,
-    /// The repository (default: the current directory).
+    /// The repository (default: the current directory). With `--host`, an
+    /// absolute path on that host.
     #[arg(long)]
     repo: Option<PathBuf>,
+    /// Where workers run: `local` or a `[hosts.<name>]` from the config.
+    #[arg(long)]
+    host: Option<String>,
     /// The branch work merges into; it must be checked out.
     #[arg(long)]
     base: Option<String>,
@@ -176,10 +180,24 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         anyhow::bail!("say what to get done: jefe \"<goal>\"");
     }
     let config = Config::load(&a.config.unwrap_or_else(jefe::paths::config_file))?;
-    let repo = a.repo.unwrap_or_else(|| PathBuf::from("."));
-    let repo = repo
-        .canonicalize()
-        .with_context(|| format!("no repository at {}", repo.display()))?;
+    let host = config.job_host(a.host.as_deref())?;
+    let (repo_str, prompts) = if host.is_local() {
+        let repo = a.repo.unwrap_or_else(|| PathBuf::from("."));
+        let repo = repo
+            .canonicalize()
+            .with_context(|| format!("no repository at {}", repo.display()))?;
+        (repo.to_string_lossy().into_owned(), jefe::repo_prompts(&repo))
+    } else {
+        // The path is the host's; nothing here can check it. Preflight does.
+        let repo = a
+            .repo
+            .with_context(|| format!("say which repository on host {}: --repo /abs/path", host.name))?;
+        let repo = repo.to_string_lossy().into_owned();
+        if !repo.starts_with('/') {
+            anyhow::bail!("--repo must be an absolute path on host {}", host.name);
+        }
+        (repo, jefe_core::prompts::Prompts::default())
+    };
     let id = a.id.unwrap_or_else(jefe::new_job_id);
     if !jefe_core::ids::valid_job_id(&id) {
         anyhow::bail!("bad job id {id:?}: use up to 40 letters, digits, '-' or '_'");
@@ -204,20 +222,19 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         budget.review_required = false;
     }
     let attended = !a.unattended && (a.json || std::io::stdin().is_terminal());
-    let repo_str = repo.to_string_lossy().into_owned();
     let spec = JobSpec {
         id: JobId(id),
         goal,
         repo: repo_str,
         base: a.base,
-        host: HostId::local(),
+        host: host.name.clone(),
         workers,
         budget,
         attended,
         allow_dirty: a.allow_dirty,
         squash: config.merge.squash,
         max_diff_chars: config.review.max_diff_chars,
-        prompts: jefe::repo_prompts(&repo),
+        prompts,
     };
     let brain = (a.brain.unwrap_or(config.brain.kind) == BrainKind::Harness).then(|| HarnessBrain {
         job: spec.id.clone(),
@@ -230,7 +247,7 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         timeout_ms: spec.budget.brain_timeout_ms,
         prompts: spec.prompts.clone(),
     });
-    let report = runtime()?.block_on(jefe::start(spec, brain, mode(a.json), attended))?;
+    let report = runtime()?.block_on(jefe::start(spec, host, brain, mode(a.json), attended))?;
     Ok(jefe::output::exit_code(report.status))
 }
 

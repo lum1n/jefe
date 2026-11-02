@@ -3,6 +3,7 @@
 pub mod brain;
 pub mod config;
 pub mod driver;
+pub mod hosts;
 pub mod output;
 pub mod paths;
 pub mod store;
@@ -10,7 +11,6 @@ pub mod store;
 use std::sync::Arc;
 
 use acc_core::session::SessionSpec;
-use acc_ssh::Host;
 use anyhow::Context as _;
 use jefe_core::prompts::Prompts;
 use jefe_core::{HumanReply, Input, Jefe, JobSpec, Report};
@@ -18,6 +18,7 @@ use serde::Serialize;
 
 pub use brain::HarnessBrain;
 pub use driver::{BrainRunner, Supervisor};
+pub use hosts::{HostConfig, JobHost};
 pub use output::{Mode, Output};
 pub use store::Store;
 
@@ -87,18 +88,31 @@ fn runner(brain: Option<HarnessBrain>) -> BrainRunner {
     }
 }
 
-/// Starts a new job and supervises it to the end.
+/// Starts a new job on `host` (whose name must be `spec.host`) and
+/// supervises it to the end.
 pub async fn start(
     spec: JobSpec,
+    host: JobHost,
     brain: Option<HarnessBrain>,
     mode: Mode,
     control: bool,
 ) -> anyhow::Result<Report> {
+    anyhow::ensure!(
+        spec.host == host.name,
+        "job host {} is not {}",
+        spec.host,
+        host.name
+    );
+    let conn = host.open()?;
+    conn.connect()
+        .await
+        .with_context(|| format!("connecting to host {}", host.name))?;
     let store = Store::open(spec.id.as_str())?;
     store.save_brain(brain.as_ref())?;
+    store.save_host(&host)?;
     let out = Output::new(mode, spec.id.clone());
     let (jefe, effects) = Jefe::new(spec, driver::now_ms());
-    let host = Arc::new(Host::local());
+    let host = conn;
     Supervisor::new(jefe, host, store, out, runner(brain))
         .run(effects, Vec::new(), control)
         .await
@@ -111,10 +125,11 @@ pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow
         anyhow::bail!("job {id} is being driven by jefe process {pid}");
     }
     let snapshot = store::load(id)?;
-    let host = Arc::new(Host::local());
+    let job_host = store::load_host(id)?;
+    let host = job_host.open()?;
     let specs: Vec<SessionSpec> = acc_ssh::list(&host)
         .await
-        .context("listing acc sessions")?
+        .with_context(|| format!("listing acc sessions on host {}", job_host.name))?
         .iter()
         .filter_map(|l| SessionSpec::from_json(l.spec_json.as_deref()?))
         .collect();

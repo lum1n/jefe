@@ -479,3 +479,187 @@ fn a_conflict_becomes_a_task_and_both_sides_land() {
     assert!(env.acc_dir_is_empty("w"), "worktree left behind");
     assert!(env.acc_dir_is_empty("s"), "session left behind");
 }
+
+/// An unprivileged `sshd` on a loopback port that logs in only the user
+/// running the tests, with a key of its own, and sets `$HOME` to the test's
+/// home so acc's state on "the host" is the test's.
+struct Sshd {
+    child: std::process::Child,
+    port: u16,
+    fingerprint: String,
+    identity: PathBuf,
+}
+
+impl Sshd {
+    /// `None` when this machine has no sshd.
+    fn start(env: &Env) -> Option<Self> {
+        let bin = ["/usr/sbin/sshd", "/usr/bin/sshd"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())?;
+        let dir = env.root.join("sshd");
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(
+            &dir,
+            "ssh-keygen -q -t ed25519 -N '' -f hostkey && ssh-keygen -q -t ed25519 -N '' -f client \
+             && cp client.pub authorized_keys",
+        );
+        let fingerprint = sh(&dir, "ssh-keygen -lf hostkey.pub")
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            dir.join("sshd_config"),
+            format!(
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/hostkey\n\
+                 AuthorizedKeysFile {d}/authorized_keys\nPidFile none\nUsePAM no\nStrictModes no\n\
+                 PasswordAuthentication no\nKbdInteractiveAuthentication no\nSetEnv HOME={home}\n",
+                d = dir.display(),
+                home = env.home().display()
+            ),
+        )
+        .unwrap();
+        let child = Command::new(bin)
+            .args(["-D", "-e", "-f"])
+            .arg(dir.join("sshd_config"))
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("sshd.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "sshd never listened: {}",
+                std::fs::read_to_string(dir.join("sshd.log")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(Self {
+            child,
+            port,
+            fingerprint,
+            identity: dir.join("client"),
+        })
+    }
+}
+
+impl Drop for Sshd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The job runs on an SSH host: preflight, workers, the harness brain and
+/// merges all go over SSH, and `attach` after `kill -9` reaches the same
+/// host from what the job saved.
+#[test]
+fn a_job_runs_on_an_ssh_host_and_attach_finds_it_again() {
+    let env = Env::new();
+    let Some(sshd) = Sshd::start(&env) else {
+        eprintln!("skipped: no sshd on this machine");
+        return;
+    };
+    let user = std::env::var("USER").unwrap();
+    let mut config = std::fs::read_to_string(env.root.join("jefe.toml")).unwrap();
+    config.push_str(&format!(
+        "\n[hosts.loop]\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{user}\"\nidentity = \"{}\"\n\
+         fingerprints = [\"{}\"]\n",
+        sshd.port,
+        sshd.identity.display(),
+        sshd.fingerprint
+    ));
+    std::fs::write(env.root.join("jefe.toml"), config).unwrap();
+    let repo = env.repo().to_string_lossy().into_owned();
+
+    let out = env.jefe(&["add hello", "--host", "nope", "--repo", &repo]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("no [hosts.nope]"), "{}", text(&out));
+    let out = env.jefe(&["add hello", "--host", "loop"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("--repo"), "{}", text(&out));
+
+    std::fs::write(env.home().join("hold"), "").unwrap();
+    let mut child = env
+        .command(&[
+            "add hello",
+            "--json",
+            "--unattended",
+            "--brain",
+            "harness",
+            "--host",
+            "loop",
+            "--repo",
+            &repo,
+            "--id",
+            "r1",
+        ])
+        .current_dir(&env.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !env.home().join("started").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let out = child.wait_with_output().unwrap();
+            panic!("jefe exited early ({status}): {}", text(&out));
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the worker never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    child.kill().unwrap();
+    let first = child.wait_with_output().unwrap();
+    let saved = std::fs::read_to_string(env.root.join("state/jobs/r1/host.json")).unwrap();
+    assert!(saved.contains("\"name\":\"loop\""), "{saved}");
+    let job = std::fs::read_to_string(env.root.join("state/jobs/r1/job.json")).unwrap();
+    assert!(job.contains("\"host\":\"loop\""), "{job}");
+
+    let attach = env
+        .command(&["attach", "r1", "--json"])
+        .current_dir(&env.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !env.root.join("state/jobs/r1/pid").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "attach never claimed the job"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::write(env.home().join("go"), "").unwrap();
+    let out = attach.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "first run: {}\nattach: {}",
+        text(&first),
+        text(&out)
+    );
+    let lines = events(&out.stdout);
+    let types = event_types(&lines);
+    assert!(types.iter().any(|t| t == "merged"), "{types:?}");
+    assert!(!types.iter().any(|t| t == "worker_spawned"), "{types:?}");
+    assert_eq!(decisions_by(&lines, "brain"), ["accept", "done"], "{lines:?}");
+    assert_eq!(
+        std::fs::read_to_string(env.repo().join("hello.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(env.acc_dir_is_empty("w"), "worktree left behind");
+    assert!(env.acc_dir_is_empty("s"), "session left behind");
+    let log = std::fs::read_to_string(env.root.join("sshd/sshd.log")).unwrap();
+    assert!(log.contains("Accepted publickey"), "{log}");
+}

@@ -10,3 +10,4 @@
 - `Input::Bytes` serializes as a string when the bytes are UTF-8.
 - `--brain harness`: each consultation is a one-shot acc session on the user's harness (`--brain-harness`, `[brain]`), read-only policy, optional read-only sandbox, one retry when the reply has no decision block, a timeout, then the rules; exchanges saved to `brain/<ask>.md`, the choice to `brain.json` so `attach` keeps it.
 - The report's `merged` list names the tasks whose work landed; a conflict task's merge is listed under the task it resolved.
+- `--host <name>`: run a job's workers, brain and merges on a `[hosts.<name>]` from `jefe.toml` over SSH (acc-ssh): SSH agent or an unencrypted `identity` file, host keys from `known_hosts` (default `~/.ssh/known_hosts`) or pinned `fingerprints`. `--repo` is then an absolute path on that host. The host is saved as `host.json` so `attach` and `stop` reach it again.

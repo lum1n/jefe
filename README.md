@@ -6,7 +6,7 @@ It runs on [acc](https://github.com/lum1n/acc), so the agents can be Claude Code
 
 jefe talks prose when you run it yourself and NDJSON (`--json`) when another program embeds it. The supervision loop is a sans-IO crate, `jefe-core`, that other programs can drive directly.
 
-**Status:** early. The binary runs jobs on this machine; SSH hosts come next. See `CHANGELOG.md`.
+**Status:** early. The binary runs jobs on this machine or on an SSH host (`--host`, `[hosts.<name>]`). See `CHANGELOG.md`.
 
 ```
 jefe "add a --version flag"            # in the repository, on its base branch
