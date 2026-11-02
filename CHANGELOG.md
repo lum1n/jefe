@@ -4,6 +4,7 @@
 
 - `[workers] unmatched = "deny" | "brain" | "human"`: who decides approvals no policy rule matches. `brain` adds the `approval` trigger and the `allow` and `deny` actions (the rules brain always denies); `human` asks, and denies when nobody is attending. New event `permission_granted`.
 - A stalled worker can be respawned or handed off.
+- Library: `jefe::start_embedded` / `resume_embedded` run a job in the caller's runtime with protocol messages as typed `jefe::Message` values and a `jefe::Control` handle. Nothing is printed, and stdin and signals are left alone.
 - `jefe status --live` (`-f`) prints a job's events as they happen until it ends.
 - Each worker's last message when it reports is saved as `workers/<id>/final.md` in the job's directory.
 - Workers may run `git remote` (list, `-v`, `get-url`) and `git rev-parse` without asking; changing remotes stays denied.

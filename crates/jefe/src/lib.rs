@@ -17,9 +17,9 @@ use jefe_core::{HumanReply, Input, Jefe, JobSpec, Report};
 use serde::Serialize;
 
 pub use brain::HarnessBrain;
-pub use driver::{BrainRunner, Supervisor};
+pub use driver::{BrainRunner, Control, Supervisor};
 pub use hosts::{HostConfig, JobHost};
-pub use output::{Mode, Output};
+pub use output::{Message, Mode, Output};
 pub use store::Store;
 
 /// What this build supports, for `jefe capabilities --json`.
@@ -88,8 +88,19 @@ fn runner(brain: Option<HarnessBrain>) -> BrainRunner {
     }
 }
 
+/// A job driven inside the embedding program's tokio runtime.
+#[derive(Debug)]
+pub struct Embedded {
+    /// Every protocol message, in order; it ends after `bye`.
+    pub messages: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    /// Answers, nudges, cancel and status requests.
+    pub control: Control,
+    /// The job's report, once it is over.
+    pub done: tokio::task::JoinHandle<anyhow::Result<Report>>,
+}
+
 /// Starts a new job on `host` (whose name must be `spec.host`) and
-/// supervises it to the end.
+/// supervises it to the end, printing to stdout.
 pub async fn start(
     spec: JobSpec,
     host: JobHost,
@@ -97,12 +108,45 @@ pub async fn start(
     mode: Mode,
     control: bool,
 ) -> anyhow::Result<Report> {
+    let (sup, effects) = prepare_start(spec, host, brain, |job| Output::new(mode, job)).await?;
+    sup.run(effects, Vec::new(), control).await
+}
+
+/// Like [`start`], but nothing is printed and no stdin or signals are read:
+/// messages come on [`Embedded::messages`] and control goes through
+/// [`Embedded::control`]. Job state is still kept under `JEFE_STATE_DIR`.
+pub async fn start_embedded(
+    spec: JobSpec,
+    host: JobHost,
+    brain: Option<HarnessBrain>,
+) -> anyhow::Result<Embedded> {
+    let (tx, messages) = tokio::sync::mpsc::unbounded_channel();
+    let (sup, effects) = prepare_start(spec, host, brain, |job| Output::embedded(job, tx)).await?;
+    let sup = sup.without_signals();
+    let control = sup.control();
+    let done = tokio::spawn(sup.run(effects, Vec::new(), false));
+    Ok(Embedded {
+        messages,
+        control,
+        done,
+    })
+}
+
+async fn prepare_start(
+    spec: JobSpec,
+    host: JobHost,
+    brain: Option<HarnessBrain>,
+    out: impl FnOnce(jefe_core::JobId) -> Output,
+) -> anyhow::Result<(Supervisor, Vec<jefe_core::Effect>)> {
     anyhow::ensure!(
         spec.host == host.name,
         "job host {} is not {}",
         spec.host,
         host.name
     );
+    if store::Store::dir_for(spec.id.as_str()).join("job.json").exists() {
+        anyhow::bail!("job {} exists; resume it instead", spec.id);
+    }
     let conn = host.open()?;
     conn.connect()
         .await
@@ -110,17 +154,56 @@ pub async fn start(
     let store = Store::open(spec.id.as_str())?;
     store.save_brain(brain.as_ref())?;
     store.save_host(&host)?;
-    let out = Output::new(mode, spec.id.clone());
+    let out = out(spec.id.clone());
     let (jefe, effects) = Jefe::new(spec, driver::now_ms());
-    let host = conn;
-    Supervisor::new(jefe, host, store, out, runner(brain))
-        .run(effects, Vec::new(), control)
-        .await
+    Ok((Supervisor::new(jefe, conn, store, out, runner(brain)), effects))
 }
 
 /// Picks job `id` up where its last jefe process left it, reattaching to
 /// its workers' acc sessions. With `cancel`, stops it instead.
 pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow::Result<Report> {
+    match prepare_resume(id, cancel, |job| Output::new(mode, job)).await? {
+        Resumed::Over(report) => Ok(report),
+        Resumed::Running(sup, effects, first) => sup.run(effects, first, control).await,
+    }
+}
+
+/// [`resume`] for an embedding program, as [`start_embedded`] is for [`start`].
+pub async fn resume_embedded(id: &str) -> anyhow::Result<Embedded> {
+    let (tx, messages) = tokio::sync::mpsc::unbounded_channel();
+    match prepare_resume(id, false, |job| Output::embedded(job, tx)).await? {
+        Resumed::Over(report) => {
+            // Nothing to drive; the `bye` is already in `messages`.
+            let control = Control::detached();
+            Ok(Embedded {
+                messages,
+                control,
+                done: tokio::spawn(async move { Ok(report) }),
+            })
+        }
+        Resumed::Running(sup, effects, first) => {
+            let sup = (*sup).without_signals();
+            let control = sup.control();
+            let done = tokio::spawn(sup.run(effects, first, false));
+            Ok(Embedded {
+                messages,
+                control,
+                done,
+            })
+        }
+    }
+}
+
+enum Resumed {
+    Over(Report),
+    Running(Box<Supervisor>, Vec<jefe_core::Effect>, Vec<Input>),
+}
+
+async fn prepare_resume(
+    id: &str,
+    cancel: bool,
+    out: impl FnOnce(jefe_core::JobId) -> Output,
+) -> anyhow::Result<Resumed> {
     if let Some(pid) = store::driver_pid(id) {
         anyhow::bail!("job {id} is being driven by jefe process {pid}");
     }
@@ -134,7 +217,7 @@ pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow
         .filter_map(|l| SessionSpec::from_json(l.spec_json.as_deref()?))
         .collect();
     let (jefe, effects) = Jefe::restore(&snapshot, &specs, driver::now_ms())?;
-    let out = Output::new(mode, jefe.job().id.clone());
+    let out = out(jefe.job().id.clone());
     if jefe.is_finished() {
         let report = jefe
             .job()
@@ -142,7 +225,7 @@ pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow
             .clone()
             .ok_or_else(|| anyhow::anyhow!("job {id} finished without a report"))?;
         out.finished(&report);
-        return Ok(report);
+        return Ok(Resumed::Over(report));
     }
     let store = Store::open(id)?;
     let first = if cancel {
@@ -151,7 +234,9 @@ pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow
         Vec::new()
     };
     let brain = store::load_brain(id)?;
-    Supervisor::new(jefe, host, store, out, runner(brain))
-        .run(effects, first, control)
-        .await
+    Ok(Resumed::Running(
+        Box::new(Supervisor::new(jefe, host, store, out, runner(brain))),
+        effects,
+        first,
+    ))
 }

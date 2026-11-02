@@ -22,9 +22,25 @@ For tests, point `[workers] launcher` and `[brain] launcher` at scripts that spe
 
 ## 2. The `jefe` crate
 
-`jefe::start(spec, host, brain, Mode::Json, control)` and `jefe::resume(id, mode, control, cancel)` run the same supervisor in your tokio runtime and return the `Report`. Build the `JobSpec` yourself (`JobSpec::new(id, goal, repo)` plus the fields you need), get the host from `Config::job_host(name)` or `JobHost::local()`, and pass `Some(HarnessBrain { … })` for a harness brain or `None` for the rules.
+`jefe::start_embedded(spec, host, brain)` runs the supervisor in your tokio runtime. It prints nothing and reads neither stdin nor signals. You get back an `Embedded`:
 
-Limits as of 0.1.0: output goes to the process's stdout (prose or protocol lines), job state goes to `JEFE_STATE_DIR`, and stdin is read when `control` is true. If you need events as values instead, use the core.
+- `messages`: an unbounded receiver of `jefe::Message`. These are the protocol's envelopes as values (`Hello`, `Event(Stamped)`, `Ask`, `Snapshot`, `Error`, `Bye`), and they serialize to exactly the lines `--json` prints.
+- `control`: a `jefe::Control` with `answer(ask, text)`, `nudge(text)`, `cancel()` and `status()`. It is cheap to clone.
+- `done`: a `JoinHandle` that resolves to the job's `Report`.
+
+```rust
+let mut spec = jefe_core::JobSpec::new("my-job-17", "add a --version flag", "/src/proj");
+spec.workers = jefe::config::Config::load(&path)?.worker_config();
+let mut job = jefe::start_embedded(spec, jefe::JobHost::local(), None).await?;
+while let Some(m) = job.messages.recv().await {
+    if let jefe::Message::Ask { ask, .. } = &m { job.control.answer(Some(ask.clone()), "yes"); }
+}
+let report = job.done.await??;
+```
+
+Pass `Some(HarnessBrain { … })` for a harness brain or `None` for the rules. For an SSH host, use `Config::job_host(name)`. `jefe::resume_embedded(id)` picks up a job whose driver died. Job state still goes to `JEFE_STATE_DIR` (default `~/.local/state/jefe`), so the CLI's `status`, `attach` and `stop` work on embedded jobs too.
+
+`jefe::start` and `jefe::resume` are the CLI's versions: they print prose or protocol lines to stdout.
 
 ## 3. The sans-IO core (`jefe-core`)
 

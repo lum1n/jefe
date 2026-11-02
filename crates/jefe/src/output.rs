@@ -6,13 +6,43 @@ use std::io::Write as _;
 
 use jefe_core::brain::DecisionSource;
 use jefe_core::result::ResultStatus;
-use jefe_core::{Event, JobId, JobStatus, Report, Stamped};
-use serde_json::json;
+use jefe_core::{AskId, Event, JobId, JobStatus, Report, Stamped};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Prose,
     Json,
+}
+
+/// One line of the protocol (`docs/PROTOCOL.md`), as a value. `--json`
+/// prints these; an embedder gets them from [`crate::start_embedded`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Message {
+    Hello {
+        version: u32,
+        job: JobId,
+        jefe: String,
+        acc: String,
+    },
+    Event(Stamped),
+    Ask {
+        ask: AskId,
+        question: String,
+        options: Vec<String>,
+    },
+    Snapshot {
+        job: serde_json::Value,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    Bye {
+        status: JobStatus,
+    },
 }
 
 #[derive(Debug)]
@@ -21,6 +51,8 @@ pub struct Output {
     job: JobId,
     /// The open question's options, so a prose answer can be a number.
     options: Vec<String>,
+    /// Where messages go instead of stdout, when embedded.
+    sink: Option<UnboundedSender<Message>>,
 }
 
 impl Output {
@@ -29,6 +61,17 @@ impl Output {
             mode,
             job,
             options: Vec::new(),
+            sink: None,
+        }
+    }
+
+    /// Sends every message to `sink` and prints nothing.
+    pub fn embedded(job: JobId, sink: UnboundedSender<Message>) -> Self {
+        Self {
+            mode: Mode::Json,
+            job,
+            options: Vec::new(),
+            sink: Some(sink),
         }
     }
 
@@ -38,31 +81,29 @@ impl Output {
         let _ = out.flush();
     }
 
-    fn json(&self, value: &serde_json::Value) {
-        self.line(&value.to_string());
+    fn message(&self, m: Message) {
+        match &self.sink {
+            Some(sink) => {
+                let _ = sink.send(m);
+            }
+            None => self.line(&serde_json::to_string(&m).unwrap_or_default()),
+        }
     }
 
     pub fn hello(&self) {
         if self.mode == Mode::Json {
-            self.json(&json!({
-                "type": "hello",
-                "version": jefe_core::PROTOCOL_VERSION,
-                "job": self.job,
-                "jefe": env!("CARGO_PKG_VERSION"),
-                "acc": acc_core::VERSION,
-            }));
+            self.message(Message::Hello {
+                version: jefe_core::PROTOCOL_VERSION,
+                job: self.job.clone(),
+                jefe: env!("CARGO_PKG_VERSION").to_owned(),
+                acc: acc_core::VERSION.to_owned(),
+            });
         }
     }
 
     pub fn event(&self, s: &Stamped) {
         match self.mode {
-            Mode::Json => self.json(&json!({
-                "type": "event",
-                "seq": s.seq,
-                "at_ms": s.at_ms,
-                "job": s.job,
-                "event": s.event,
-            })),
+            Mode::Json => self.message(Message::Event(s.clone())),
             Mode::Prose => {
                 if let Some(text) = describe(&s.event, &self.job) {
                     self.line(&text);
@@ -71,15 +112,14 @@ impl Output {
         }
     }
 
-    pub fn ask(&mut self, ask: &jefe_core::AskId, question: &str, options: &[String]) {
+    pub fn ask(&mut self, ask: &AskId, question: &str, options: &[String]) {
         self.options = options.to_vec();
         match self.mode {
-            Mode::Json => self.json(&json!({
-                "type": "ask",
-                "ask": ask,
-                "question": question,
-                "options": options,
-            })),
+            Mode::Json => self.message(Message::Ask {
+                ask: ask.clone(),
+                question: question.to_owned(),
+                options: options.to_vec(),
+            }),
             Mode::Prose => {
                 let mut text = format!("needs you: {question}");
                 for (i, o) in options.iter().enumerate() {
@@ -87,6 +127,17 @@ impl Output {
                 }
                 self.line(&text);
             }
+        }
+    }
+
+    /// A control line was ignored.
+    pub fn bad_control(&self, message: &str) {
+        match &self.sink {
+            Some(_) => self.message(Message::Error {
+                code: "bad_control".to_owned(),
+                message: message.to_owned(),
+            }),
+            None => json_error("bad_control", message),
         }
     }
 
@@ -99,12 +150,14 @@ impl Output {
     }
 
     pub fn snapshot(&self, job: &serde_json::Value) {
-        self.json(&json!({ "type": "snapshot", "job": job }));
+        self.message(Message::Snapshot { job: job.clone() });
     }
 
     pub fn finished(&self, report: &Report) {
         match self.mode {
-            Mode::Json => self.json(&json!({ "type": "bye", "status": report.status })),
+            Mode::Json => self.message(Message::Bye {
+                status: report.status,
+            }),
             Mode::Prose => self.line(report_md(report).trim_end()),
         }
     }
@@ -115,7 +168,11 @@ impl Output {
 /// (jefe stops without a `bye`).
 pub fn json_error(code: &str, message: &str) {
     eprintln!("jefe: {message}");
-    let line = json!({ "type": "error", "code": code, "message": message });
+    let line = serde_json::to_string(&Message::Error {
+        code: code.to_owned(),
+        message: message.to_owned(),
+    })
+    .unwrap_or_default();
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();

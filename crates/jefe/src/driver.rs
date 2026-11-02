@@ -29,6 +29,47 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Steers a running [`Supervisor`] from the program that embeds it: the
+/// stdin control commands as calls. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct Control(mpsc::UnboundedSender<Msg>);
+
+impl Control {
+    /// A handle that steers nothing (for a job that is already over).
+    pub(crate) fn detached() -> Self {
+        Self(mpsc::unbounded_channel().0)
+    }
+
+    /// Answers the open `ask` (or whatever is open when `None`).
+    pub fn answer(&self, ask: Option<jefe_core::AskId>, text: &str) {
+        self.human(HumanReply::Answer {
+            ask,
+            text: text.to_owned(),
+        });
+    }
+
+    /// A note for the brain.
+    pub fn nudge(&self, text: &str) {
+        self.human(HumanReply::Nudge {
+            text: text.to_owned(),
+        });
+    }
+
+    /// Stops the job, keeping every branch.
+    pub fn cancel(&self) {
+        self.human(HumanReply::Cancel);
+    }
+
+    /// Asks for a [`crate::output::Message::Snapshot`].
+    pub fn status(&self) {
+        let _ = self.0.send(Msg::Status);
+    }
+
+    fn human(&self, reply: HumanReply) {
+        let _ = self.0.send(Msg::Input(Input::Human(reply)));
+    }
+}
+
 #[derive(Debug)]
 enum Msg {
     Input(Input),
@@ -56,6 +97,8 @@ pub struct Supervisor {
     followers: HashMap<WorkerId, JoinHandle<()>>,
     wake_at: Option<u64>,
     report: Option<Report>,
+    /// Ctrl-C and SIGTERM cancel the job (not when embedded).
+    signals: bool,
 }
 
 impl Supervisor {
@@ -72,7 +115,18 @@ impl Supervisor {
             followers: HashMap::new(),
             wake_at: None,
             report: None,
+            signals: true,
         }
+    }
+
+    /// Leaves signals to the embedding program.
+    pub fn without_signals(mut self) -> Self {
+        self.signals = false;
+        self
+    }
+
+    pub fn control(&self) -> Control {
+        Control(self.tx.clone())
     }
 
     /// Runs `effects` (from [`Jefe::new`] or [`Jefe::restore`]), then the
@@ -92,7 +146,9 @@ impl Supervisor {
         if control {
             self.read_control();
         }
-        self.watch_signals();
+        if self.signals {
+            self.watch_signals();
+        }
         while self.report.is_none() {
             let now = now_ms();
             let due = [self.jefe.next_deadline(), self.wake_at]
