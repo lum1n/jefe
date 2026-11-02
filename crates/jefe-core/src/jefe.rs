@@ -1948,7 +1948,10 @@ impl Jefe {
                 .job
                 .tasks
                 .iter()
-                .filter(|t| t.status == TaskStatus::Merged)
+                // A conflict task's merge is listed under the task it landed.
+                .filter(|t| {
+                    t.status == TaskStatus::Merged && !matches!(t.kind, TaskKind::ResolveConflict { .. })
+                })
                 .map(|t| MergedTask {
                     task: t.id.clone(),
                     title: t.title.clone(),

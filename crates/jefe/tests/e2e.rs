@@ -20,8 +20,16 @@ while IFS= read -r line; do
         while [ ! -e "$HOME/go" ]; do sleep 0.1; done
       fi
       printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-1","cwd":"/","model":"fake","tools":[],"permissionMode":"acceptEdits"}'
-      echo hello > hello.txt
-      git add hello.txt && git commit -qm "Add hello.txt"
+      branch=$(printf '%s' "$line" | grep -o 'Run `git merge acc/[A-Za-z0-9_-]*' | head -1 | sed 's/.*merge //')
+      case "$line" in
+        *'Run `git merge acc/'*)
+          git merge -q "$branch" >/dev/null 2>&1
+          printf 'a\nb\n' > hello.txt
+          git add hello.txt && git commit -qm "Merge $branch keeping both" ;;
+        *'Your task: Write A'*) echo a > hello.txt; git add hello.txt && git commit -qm "Write a" ;;
+        *'Your task: Write B'*) echo b > hello.txt; git add hello.txt && git commit -qm "Write b" ;;
+        *) echo hello > hello.txt; git add hello.txt && git commit -qm "Add hello.txt" ;;
+      esac
       printf '%s\n' '{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","model":"fake","content":[{"type":"text","text":"Added it.\n\n```jefe-result\n{\"status\":\"done\",\"summary\":\"Added hello.txt\"}\n```"}]},"session_id":"fake-1"}'
       printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Added it.","session_id":"fake-1","num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":10,"output_tokens":5}}'
       ;;
@@ -39,11 +47,14 @@ while IFS= read -r line; do
       printf '%s\n' "$line" >> "$HOME/brain-prompts"
       text='Looks fine to me.'
       if [ ! -e "$HOME/brain-garbage" ]; then
+        task=$(printf '%s' "$line" | grep -o 'kind\\": \\"review\\",\\n *\\"task\\": \\"t[0-9]*' | head -1 | grep -o 't[0-9]*$')
         case "$line" in
+          *'Why you are asked: plan'*'write two'*|*'write two'*'Why you are asked: plan'*)
+            text='Two tasks.\n\n```jefe-decision\n{\"action\":\"plan\",\"tasks\":[{\"title\":\"Write A\",\"brief\":\"Write a to hello.txt.\"},{\"title\":\"Write B\",\"brief\":\"Write b to hello.txt.\"}],\"confidence\":0.9}\n```' ;;
           *'Why you are asked: plan'*)
             text='One task.\n\n```jefe-decision\n{\"action\":\"plan\",\"tasks\":[{\"title\":\"Add hello.txt\",\"brief\":\"Create hello.txt saying hello and commit it.\"}],\"rationale\":\"one file\",\"confidence\":0.9}\n```' ;;
           *'Why you are asked: review'*)
-            text='Good.\n\n```jefe-decision\n{\"action\":\"accept\",\"task\":\"t1\",\"rationale\":\"matches the brief\",\"confidence\":0.8}\n```' ;;
+            text='Good.\n\n```jefe-decision\n{\"action\":\"accept\",\"task\":\"'"$task"'\",\"rationale\":\"matches the brief\",\"confidence\":0.8}\n```' ;;
           *'Why you are asked: wrap'*)
             text='```jefe-decision\n{\"action\":\"done\",\"summary\":\"hello.txt added\",\"confidence\":0.9}\n```' ;;
         esac
@@ -423,4 +434,48 @@ fn a_brain_without_decisions_falls_back_to_the_rules() {
     );
     assert!(env.repo().join("hello.txt").exists());
     assert!(env.acc_dir_is_empty("s"), "a session was left behind");
+}
+
+/// Two workers write the same file: the second merge conflicts, a third
+/// worker resolves it, and both sides land.
+#[test]
+fn a_conflict_becomes_a_task_and_both_sides_land() {
+    let env = Env::new();
+    let out = env.jefe(&[
+        "write two lines",
+        "--json",
+        "--unattended",
+        "--brain",
+        "harness",
+        "--workers",
+        "2",
+        "--id",
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lines = events(&out.stdout);
+    let types = event_types(&lines);
+    let count = |t: &str| types.iter().filter(|x| *x == t).count();
+    assert_eq!(count("worker_spawned"), 3, "{types:?}");
+    assert_eq!(count("merge_conflict"), 1, "{types:?}");
+    assert_eq!(count("merged"), 2, "{types:?}");
+    let resolve = lines
+        .iter()
+        .filter(|l| l["event"]["type"] == "task_added")
+        .find(|l| l["event"]["kind"]["kind"] == "resolve_conflict")
+        .unwrap_or_else(|| panic!("no resolve task: {types:?}"));
+    assert_eq!(resolve["event"]["task"], "t3");
+    assert_eq!(
+        decisions_by(&lines, "brain")
+            .iter()
+            .filter(|a| *a == "accept")
+            .count(),
+        3
+    );
+    let hello = std::fs::read_to_string(env.repo().join("hello.txt")).unwrap();
+    assert_eq!(hello, "a\nb\n");
+    let done = lines.iter().find(|l| l["event"]["type"] == "job_done").unwrap();
+    assert_eq!(done["event"]["merged"].as_array().unwrap().len(), 2, "{done}");
+    assert!(env.acc_dir_is_empty("w"), "worktree left behind");
+    assert!(env.acc_dir_is_empty("s"), "session left behind");
 }

@@ -9,3 +9,4 @@
 - `jefe "<goal>"`, `status`, `jobs`, `attach`, `stop` and `config example|check`: one local host, the rules brain, prose or `--json` output, stdin answers and control, Ctrl-C/SIGTERM cancel, `jefe.toml`, and job state under `~/.local/state/jefe/jobs/<id>/`. `attach` restores the workers' acc sessions after jefe dies.
 - `Input::Bytes` serializes as a string when the bytes are UTF-8.
 - `--brain harness`: each consultation is a one-shot acc session on the user's harness (`--brain-harness`, `[brain]`), read-only policy, optional read-only sandbox, one retry when the reply has no decision block, a timeout, then the rules; exchanges saved to `brain/<ask>.md`, the choice to `brain.json` so `attach` keeps it.
+- The report's `merged` list names the tasks whose work landed; a conflict task's merge is listed under the task it resolved.
