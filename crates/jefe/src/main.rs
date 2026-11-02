@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use jefe::config::{BrainKind, Config};
-use jefe::{Mode, store};
+use jefe::{HarnessBrain, Mode, store};
 use jefe_core::{HostId, JobId, JobSpec};
 
 #[derive(Debug, Parser)]
@@ -38,8 +38,12 @@ struct RunArgs {
     /// The workers' harness (claude, codex, cursor, copilot, opencode, pi).
     #[arg(long)]
     harness: Option<String>,
+    /// Who decides at judgment points: built-in rules or a harness.
     #[arg(long, value_enum)]
     brain: Option<BrainKind>,
+    /// The brain's harness (default: the workers').
+    #[arg(long)]
+    brain_harness: Option<String>,
     /// Workers running at once.
     #[arg(long)]
     workers: Option<u32>,
@@ -172,9 +176,6 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         anyhow::bail!("say what to get done: jefe \"<goal>\"");
     }
     let config = Config::load(&a.config.unwrap_or_else(jefe::paths::config_file))?;
-    if a.brain.unwrap_or(config.brain.kind) == BrainKind::Harness {
-        anyhow::bail!("the harness brain isn't available yet; use --brain rules");
-    }
     let repo = a.repo.unwrap_or_else(|| PathBuf::from("."));
     let repo = repo
         .canonicalize()
@@ -188,10 +189,13 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
     }
     let mut workers = config.worker_config();
     if let Some(h) = a.harness {
-        workers.harness = serde_json::from_value(serde_json::Value::String(h.clone()))
-            .map_err(|_| anyhow::anyhow!("unknown harness {h:?}"))?;
+        workers.harness = harness(&h)?;
         workers.alternates.retain(|x| *x != workers.harness);
     }
+    let brain_harness = match a.brain_harness {
+        Some(h) => harness(&h)?,
+        None => config.brain.harness.unwrap_or(workers.harness),
+    };
     let mut budget = config.budget();
     if let Some(n) = a.workers {
         budget.max_workers = n.max(1);
@@ -215,8 +219,24 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         max_diff_chars: config.review.max_diff_chars,
         prompts: jefe::repo_prompts(&repo),
     };
-    let report = runtime()?.block_on(jefe::start(spec, mode(a.json), attended))?;
+    let brain = (a.brain.unwrap_or(config.brain.kind) == BrainKind::Harness).then(|| HarnessBrain {
+        job: spec.id.clone(),
+        repo: spec.repo.clone(),
+        harness: brain_harness,
+        model: config.brain.model.clone(),
+        permission: config.brain.permission.clone(),
+        launcher: config.brain.launcher.clone(),
+        sandbox: config.brain.sandbox,
+        timeout_ms: spec.budget.brain_timeout_ms,
+        prompts: spec.prompts.clone(),
+    });
+    let report = runtime()?.block_on(jefe::start(spec, brain, mode(a.json), attended))?;
     Ok(jefe::output::exit_code(report.status))
+}
+
+fn harness(name: &str) -> anyhow::Result<acc_core::Harness> {
+    serde_json::from_value(serde_json::Value::String(name.to_owned()))
+        .map_err(|_| anyhow::anyhow!("unknown harness {name:?}"))
 }
 
 fn latest(job: Option<String>) -> anyhow::Result<String> {

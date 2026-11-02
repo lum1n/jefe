@@ -1,5 +1,6 @@
 //! jefe as a library: the host side of the supervision loop.
 
+pub mod brain;
 pub mod config;
 pub mod driver;
 pub mod output;
@@ -15,7 +16,8 @@ use jefe_core::prompts::Prompts;
 use jefe_core::{HumanReply, Input, Jefe, JobSpec, Report};
 use serde::Serialize;
 
-pub use driver::Supervisor;
+pub use brain::HarnessBrain;
+pub use driver::{BrainRunner, Supervisor};
 pub use output::{Mode, Output};
 pub use store::Store;
 
@@ -43,7 +45,7 @@ pub fn capabilities() -> Capabilities {
             .iter()
             .filter_map(|h| serde_json::to_value(h).ok()?.as_str().map(str::to_owned))
             .collect(),
-        brains: vec!["rules"],
+        brains: vec!["rules", "harness"],
     }
 }
 
@@ -78,13 +80,26 @@ pub fn repo_prompts(repo: &std::path::Path) -> Prompts {
     p
 }
 
+fn runner(brain: Option<HarnessBrain>) -> BrainRunner {
+    match brain {
+        Some(b) => BrainRunner::Harness(Arc::new(b)),
+        None => BrainRunner::Rules,
+    }
+}
+
 /// Starts a new job and supervises it to the end.
-pub async fn start(spec: JobSpec, mode: Mode, control: bool) -> anyhow::Result<Report> {
+pub async fn start(
+    spec: JobSpec,
+    brain: Option<HarnessBrain>,
+    mode: Mode,
+    control: bool,
+) -> anyhow::Result<Report> {
     let store = Store::open(spec.id.as_str())?;
+    store.save_brain(brain.as_ref())?;
     let out = Output::new(mode, spec.id.clone());
     let (jefe, effects) = Jefe::new(spec, driver::now_ms());
     let host = Arc::new(Host::local());
-    Supervisor::new(jefe, host, store, out)
+    Supervisor::new(jefe, host, store, out, runner(brain))
         .run(effects, Vec::new(), control)
         .await
 }
@@ -120,7 +135,8 @@ pub async fn resume(id: &str, mode: Mode, control: bool, cancel: bool) -> anyhow
     } else {
         Vec::new()
     };
-    Supervisor::new(jefe, host, store, out)
+    let brain = store::load_brain(id)?;
+    Supervisor::new(jefe, host, store, out, runner(brain))
         .run(effects, first, control)
         .await
 }

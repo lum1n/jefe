@@ -29,6 +29,33 @@ while IFS= read -r line; do
 done
 "##;
 
+/// A brain on Claude's stream-json: plans one task, accepts it and wraps
+/// up, by the trigger named in its prompt. With `$HOME/brain-garbage` it
+/// never gives a decision block.
+const FAKE_BRAIN: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line" >> "$HOME/brain-prompts"
+      text='Looks fine to me.'
+      if [ ! -e "$HOME/brain-garbage" ]; then
+        case "$line" in
+          *'Why you are asked: plan'*)
+            text='One task.\n\n```jefe-decision\n{\"action\":\"plan\",\"tasks\":[{\"title\":\"Add hello.txt\",\"brief\":\"Create hello.txt saying hello and commit it.\"}],\"rationale\":\"one file\",\"confidence\":0.9}\n```' ;;
+          *'Why you are asked: review'*)
+            text='Good.\n\n```jefe-decision\n{\"action\":\"accept\",\"task\":\"t1\",\"rationale\":\"matches the brief\",\"confidence\":0.8}\n```' ;;
+          *'Why you are asked: wrap'*)
+            text='```jefe-decision\n{\"action\":\"done\",\"summary\":\"hello.txt added\",\"confidence\":0.9}\n```' ;;
+        esac
+      fi
+      printf '%s\n' '{"type":"system","subtype":"init","session_id":"brain-1","cwd":"/","model":"fake-brain","tools":[],"permissionMode":"default"}'
+      printf '%s%s%s\n' '{"type":"assistant","message":{"id":"msg_b","type":"message","role":"assistant","model":"fake-brain","content":[{"type":"text","text":"' "$text" '"}]},"session_id":"brain-1"}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"brain-1","num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":10,"output_tokens":5}}'
+      ;;
+  esac
+done
+"##;
+
 fn sh(dir: &Path, script: &str) -> String {
     let out = Command::new("sh")
         .arg("-c")
@@ -74,12 +101,16 @@ impl Env {
         let fake = root.join("bin/claude");
         std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
         std::fs::write(&fake, FAKE_CLAUDE).unwrap();
-        sh(&root, &format!("chmod +x {}", fake.display()));
+        let brain = root.join("bin/brain");
+        std::fs::write(&brain, FAKE_BRAIN).unwrap();
+        sh(&root, &format!("chmod +x {} {}", fake.display(), brain.display()));
         std::fs::write(
             root.join("jefe.toml"),
             format!(
-                "[workers]\nharness = \"claude\"\nlauncher = {{ program = \"{}\" }}\n",
-                fake.display()
+                "[workers]\nharness = \"claude\"\nlauncher = {{ program = \"{}\" }}\n\n\
+                 [brain]\nsandbox = false\ntimeout_secs = 30\nlauncher = {{ program = \"{}\" }}\n",
+                fake.display(),
+                brain.display()
             ),
         )
         .unwrap();
@@ -311,4 +342,85 @@ fn stop_cancels_and_keeps_the_branch() {
     let branches = sh(&env.repo(), "git branch --list 'acc/*'");
     assert!(branches.contains("acc/jefe-s1-w1"), "{branches}");
     assert!(!env.repo().join("hello.txt").exists());
+}
+
+fn decisions_by(lines: &[serde_json::Value], by: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| l["event"]["type"] == "decided" && l["event"]["decision"]["source"]["by"] == by)
+        .map(|l| l["event"]["decision"]["action"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The harness brain plans, reviews and wraps up; each consultation is a
+/// session of its own that is gone afterwards.
+#[test]
+fn a_harness_brain_drives_the_job() {
+    let env = Env::new();
+    let out = env.jefe(&[
+        "add hello",
+        "--json",
+        "--unattended",
+        "--brain",
+        "harness",
+        "--id",
+        "b1",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lines = events(&out.stdout);
+    assert_eq!(
+        decisions_by(&lines, "brain"),
+        ["plan", "accept", "done"],
+        "{lines:?}"
+    );
+    let added = lines.iter().find(|l| l["event"]["type"] == "task_added").unwrap();
+    assert_eq!(added["event"]["title"], "Add hello.txt");
+    let done = lines.iter().find(|l| l["event"]["type"] == "job_done").unwrap();
+    assert_eq!(done["event"]["summary"], "hello.txt added");
+    assert!(env.repo().join("hello.txt").exists());
+    assert!(env.acc_dir_is_empty("s"), "a session was left behind");
+    let prompts = std::fs::read_to_string(env.home().join("brain-prompts")).unwrap();
+    assert!(prompts.contains("You are the brain of jefe"), "{prompts}");
+    let log = std::fs::read_to_string(env.root.join("state/jobs/b1/brain/a1.md")).unwrap();
+    assert!(
+        log.contains("## Reply 1") && log.contains("\"action\":\"plan\""),
+        "{log}"
+    );
+}
+
+/// A brain that never answers with a block is asked once more, then the
+/// rules decide, and the job still gets done.
+#[test]
+fn a_brain_without_decisions_falls_back_to_the_rules() {
+    let env = Env::new();
+    std::fs::write(env.home().join("brain-garbage"), "").unwrap();
+    let out = env.jefe(&[
+        "add hello",
+        "--json",
+        "--unattended",
+        "--brain",
+        "harness",
+        "--id",
+        "g1",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lines = events(&out.stdout);
+    assert!(decisions_by(&lines, "brain").is_empty(), "{lines:?}");
+    assert!(!decisions_by(&lines, "rules").is_empty(), "{lines:?}");
+    let notices: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["event"]["type"] == "notice")
+        .filter_map(|l| l["event"]["message"].as_str())
+        .collect();
+    assert!(
+        notices.iter().any(|n| n.contains("the brain failed")),
+        "{notices:?}"
+    );
+    let prompts = std::fs::read_to_string(env.home().join("brain-prompts")).unwrap();
+    assert!(
+        prompts.contains("no valid ```jefe-decision block"),
+        "never asked again: {prompts}"
+    );
+    assert!(env.repo().join("hello.txt").exists());
+    assert!(env.acc_dir_is_empty("s"), "a session was left behind");
 }

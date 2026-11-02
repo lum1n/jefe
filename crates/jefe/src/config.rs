@@ -72,7 +72,12 @@ pub struct BrainConfig {
     /// Defaults to the workers' harness.
     pub harness: Option<Harness>,
     pub model: Option<String>,
+    /// Claude permission mode or Codex permission profile for the brain.
+    pub permission: Option<String>,
+    /// Wrap or replace the brain's harness executable.
+    pub launcher: Option<Launcher>,
     pub timeout_secs: u64,
+    /// Run the brain in acc's read-only sandbox.
     pub sandbox: bool,
 }
 
@@ -82,6 +87,8 @@ impl Default for BrainConfig {
             kind: BrainKind::Rules,
             harness: None,
             model: None,
+            permission: None,
+            launcher: None,
             timeout_secs: Budget::default().brain_timeout_ms / 1000,
             sandbox: true,
         }
@@ -156,6 +163,8 @@ alternates = ["codex"]
 kind = "rules"          # or "harness"
 # harness = "claude"
 # model = "opus"
+# permission = "default"
+# launcher = { program = "/opt/claude/bin/claude" }
 timeout_secs = 300
 sandbox = true
 

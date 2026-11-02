@@ -6,11 +6,12 @@ It runs on [acc](https://github.com/lum1n/acc), so the agents can be Claude Code
 
 jefe talks prose when you run it yourself and NDJSON (`--json`) when another program embeds it. The supervision loop is a sans-IO crate, `jefe-core`, that other programs can drive directly.
 
-**Status:** early. The binary runs jobs on this machine with the built-in rules as the brain; the harness brain and SSH hosts come next. See `CHANGELOG.md`.
+**Status:** early. The binary runs jobs on this machine; SSH hosts come next. See `CHANGELOG.md`.
 
 ```
 jefe "add a --version flag"            # in the repository, on its base branch
 jefe "..." --json --unattended         # NDJSON for programs; never waits on a human
+jefe "..." --brain harness             # a model decides at judgment points, not the rules
 jefe status [JOB] [--json]             # the latest job by default
 jefe jobs [--json]
 jefe attach JOB                        # resume a job whose jefe process died
@@ -21,6 +22,8 @@ jefe config example                    # every setting with its default
 While it runs, type an answer when it asks (a number picks an option) or `q` to cancel. In `--json` mode stdin takes `{"cmd":"answer","text":".."}`, `{"cmd":"nudge","text":".."}`, `{"cmd":"cancel"}` and `{"cmd":"status"}`.
 
 Exit codes: 0 done, 1 bad input or config, 2 failed or gave up, 3 cancelled.
+
+With `--brain harness` (or `[brain] kind = "harness"`), each judgment point (plan, review, questions, failures, wrap-up) is a one-shot session on your own harness in the repository, under a read-only policy, inside acc's read-only sandbox unless `[brain] sandbox = false`. It answers with one action from the allowed set, which jefe checks before acting; when it fails, times out or gives no valid decision twice, the rules decide. Each exchange is saved to `brain/<ask>.md` in the job's directory.
 
 Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.local/state/jefe/jobs/<id>/` (`$JEFE_STATE_DIR`): `job.json`, `events.ndjson`, `inputs.ndjson` and `report.md`. Prompts can be overridden per repository in `.jefe/prompts/{worker,chief}.md`.
 

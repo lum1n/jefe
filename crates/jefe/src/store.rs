@@ -73,6 +73,14 @@ impl Store {
         )
     }
 
+    /// Which brain the job runs with, for `attach`.
+    pub fn save_brain(&self, brain: Option<&crate::brain::HarnessBrain>) -> anyhow::Result<()> {
+        write_atomic(
+            &self.dir.join("brain.json"),
+            serde_json::to_string(&brain)?.as_bytes(),
+        )
+    }
+
     /// Gives the job up: another process may drive it now.
     pub fn release(&self) {
         let _ = fs::remove_file(self.dir.join("pid"));
@@ -97,6 +105,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 pub fn load(id: &str) -> anyhow::Result<String> {
     let path = Store::dir_for(id).join("job.json");
     fs::read_to_string(&path).with_context(|| format!("no job {id} ({})", path.display()))
+}
+
+/// The harness brain job `id` was started with; `None` for the rules.
+pub fn load_brain(id: &str) -> anyhow::Result<Option<crate::brain::HarnessBrain>> {
+    match fs::read_to_string(Store::dir_for(id).join("brain.json")) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The pid of the jefe process driving job `id`, if one is alive.

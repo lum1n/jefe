@@ -8,3 +8,4 @@
 - jefe-core: the `Brain` interface with a bounded action set, `rules::allowed`/`validate` (refused decisions are retried once, then the rules decide), `RulesBrain`, and the chief prompt and `jefe-decision` parser.
 - `jefe "<goal>"`, `status`, `jobs`, `attach`, `stop` and `config example|check`: one local host, the rules brain, prose or `--json` output, stdin answers and control, Ctrl-C/SIGTERM cancel, `jefe.toml`, and job state under `~/.local/state/jefe/jobs/<id>/`. `attach` restores the workers' acc sessions after jefe dies.
 - `Input::Bytes` serializes as a string when the bytes are UTF-8.
+- `--brain harness`: each consultation is a one-shot acc session on the user's harness (`--brain-harness`, `[brain]`), read-only policy, optional read-only sandbox, one retry when the reply has no decision block, a timeout, then the rules; exchanges saved to `brain/<ask>.md`, the choice to `brain.json` so `attach` keeps it.

@@ -12,6 +12,7 @@ use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::brain::HarnessBrain;
 use crate::output::{Mode, Output};
 use crate::store::Store;
 
@@ -35,6 +36,13 @@ enum Msg {
     Status,
 }
 
+/// Who answers the loop's consultations.
+#[derive(Debug, Clone)]
+pub enum BrainRunner {
+    Rules,
+    Harness(Arc<HarnessBrain>),
+}
+
 /// Drives one job to its end.
 #[derive(Debug)]
 pub struct Supervisor {
@@ -42,6 +50,7 @@ pub struct Supervisor {
     host: Arc<Host>,
     store: Store,
     out: Output,
+    brain: BrainRunner,
     tx: mpsc::UnboundedSender<Msg>,
     rx: mpsc::UnboundedReceiver<Msg>,
     followers: HashMap<WorkerId, JoinHandle<()>>,
@@ -50,13 +59,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(jefe: Jefe, host: Arc<Host>, store: Store, out: Output) -> Self {
+    pub fn new(jefe: Jefe, host: Arc<Host>, store: Store, out: Output, brain: BrainRunner) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             jefe,
             host,
             store,
             out,
+            brain,
             tx,
             rx,
             followers: HashMap::new(),
@@ -176,11 +186,23 @@ impl Supervisor {
                         f.abort();
                     }
                 }
-                Effect::Consult { ask, situation } => {
-                    // M2 has only the rules brain: answer in place.
-                    let decision = RulesBrain.decide(&situation);
-                    self.send(Input::Decided { ask, decision });
-                }
+                Effect::Consult { ask, situation } => match &self.brain {
+                    BrainRunner::Rules => {
+                        let decision = RulesBrain.decide(&situation);
+                        self.send(Input::Decided { ask, decision });
+                    }
+                    BrainRunner::Harness(brain) => {
+                        let (brain, host, tx) = (brain.clone(), self.host.clone(), self.tx.clone());
+                        let log_dir = Some(self.store.dir().join("brain"));
+                        tokio::spawn(async move {
+                            let input = match brain.consult(host, &ask, &situation, log_dir).await {
+                                Ok(decision) => Input::Decided { ask, decision },
+                                Err(why) => Input::BrainFailed { ask, why },
+                            };
+                            let _ = tx.send(Msg::Input(input));
+                        });
+                    }
+                },
                 Effect::AskHuman {
                     ask,
                     question,
