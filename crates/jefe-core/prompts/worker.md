@@ -11,6 +11,7 @@ You are in your own git worktree on branch `{{branch}}`. Other workers have thei
 - Commit your work on this branch with clear messages. Never push, and never touch other branches or the main checkout.
 - Follow the repository's AGENTS.md or CLAUDE.md if it has one.
 - Test what you touched with the project's own build and test commands.
+- Run shell commands one at a time, each on one line. A command containing `&&`, `;`, `|`, `>`, `<`, `$(`, a backtick or a line break is refused, even inside quotes. For a commit message with a body, repeat `-m` (`git commit -m "Title" -m "Body"`), and leave out anything with `<` or `>` in it, such as email trailers. Write files with your edit tool, not shell redirects.
 - If you need a decision you can't make yourself, stop and ask with `needs_input` and your questions rather than guessing or stopping silently.
 {{feedback}}
 End your final message with exactly one result block:

@@ -43,19 +43,57 @@ fn claude_brain_plans_and_a_claude_worker_delivers() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The timeline, for `--nocapture`.
-    for l in stdout
+    // The timeline, for `--nocapture`: seconds since the first event, and how
+    // long each brain consult and each worker turn took.
+    let lines: Vec<serde_json::Value> = stdout
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-    {
-        let e = &l["event"];
-        if l["type"] == "event" {
-            let what = e["decision"]["action"]
-                .as_str()
-                .or(e["message"].as_str())
-                .unwrap_or("");
-            eprintln!("{} {} {what}", l["at_ms"], e["type"].as_str().unwrap_or(""));
-        }
+        .filter(|l| l["type"] == "event")
+        .collect();
+    let t0 = lines.first().and_then(|l| l["at_ms"].as_u64()).unwrap_or(0);
+    let mut since: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut slowest = 0;
+    for l in &lines {
+        let (e, at) = (&l["event"], l["at_ms"].as_u64().unwrap_or(0));
+        let kind = e["type"].as_str().unwrap_or("");
+        let key = match kind {
+            "consulted" | "decided" => format!("ask {}", e["ask"].as_str().unwrap_or("")),
+            "worker_spawned" | "worker_prompted" | "worker_reported" => {
+                format!("worker {}", e["worker"].as_str().unwrap_or(""))
+            }
+            _ => String::new(),
+        };
+        let took = match kind {
+            "consulted" | "worker_spawned" | "worker_prompted" => {
+                since.insert(key, at);
+                String::new()
+            }
+            "decided" | "worker_reported" => since.remove(&key).map_or(String::new(), |s| {
+                let ms = at.saturating_sub(s);
+                slowest = slowest.max(ms);
+                format!(" (took {:.1} s)", ms as f64 / 1000.0)
+            }),
+            _ => String::new(),
+        };
+        let what = e["decision"]["action"]
+            .as_str()
+            .or(e["message"].as_str())
+            .or(e["title"].as_str())
+            .unwrap_or("");
+        eprintln!(
+            "{:7.1} s  {kind} {what}{took}",
+            at.saturating_sub(t0) as f64 / 1000.0
+        );
+    }
+    let total = lines.last().and_then(|l| l["at_ms"].as_u64()).unwrap_or(t0) - t0;
+    eprintln!(
+        "total {:.1} s, slowest step {:.1} s",
+        total as f64 / 1000.0,
+        slowest as f64 / 1000.0
+    );
+    if total > 120_000 {
+        // Keep a slow run's state (brain/<ask>.md, events) to see where the time went.
+        eprintln!("slow run kept in {}", tmp.keep().display());
     }
     let decided: Vec<serde_json::Value> = stdout
         .lines()
