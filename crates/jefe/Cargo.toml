@@ -1,0 +1,23 @@
+[package]
+name = "jefe"
+description = "A chief orchestrator: delegates a goal to coding agents through acc and supervises them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jefe-core.workspace = true
+acc-core.workspace = true
+acc-ssh = { workspace = true, features = ["local"] }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
