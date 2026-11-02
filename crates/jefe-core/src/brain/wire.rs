@@ -19,6 +19,8 @@ pub fn schema_line(kind: ActionKind) -> &'static str {
         ActionKind::Answer => {
             r#"{"action":"answer","worker":"<worker id>","answers":[["answer to question 1"],["a","b"]]}"#
         }
+        ActionKind::Allow => r#"{"action":"allow","worker":"<worker id>"}"#,
+        ActionKind::Deny => r#"{"action":"deny","worker":"<worker id>"}"#,
         ActionKind::Interrupt => r#"{"action":"interrupt","worker":"<worker id>"}"#,
         ActionKind::Handoff => {
             r#"{"action":"handoff","worker":"<worker id>","harness":"codex","prompt":"optional next message"}"#

@@ -42,7 +42,7 @@ Control is read when the job is attended, which is the default with `--json`. `-
 | `{"cmd":"cancel"}` | stops the job and keeps every branch; ends with `job_cancelled` and `bye` |
 | `{"cmd":"status"}` | prints a `snapshot` |
 
-How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again.
+How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On an approval, `y`, `yes`, `ok` or `allow` grant it, and anything else denies it. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again.
 
 ## Events
 
@@ -80,7 +80,8 @@ Each `event` object has a `type`. Below are its fields. `?` marks a field that m
 | `worker_prompted` | `worker`, `text` |
 | `worker_blocked` | `worker`, `kind` (`permission`, `question`, `auth`), `title` |
 | `worker_answered` | `worker`, `answers` (one list of answers per question) |
-| `permission_denied` | `worker`, `title`: an approval no policy rule allowed |
+| `permission_denied` | `worker`, `title`: an approval was refused (by default, every one no policy rule allows) |
+| `permission_granted` | `worker`, `title`: an approval no policy rule matched was granted by the brain or the human (`[workers] unmatched`) |
 | `worker_reported` | `worker`, `task`, `result` |
 | `worker_stalled` | `worker`, `idle_ms` |
 | `worker_errored` | `worker`, `message` |
@@ -112,6 +113,7 @@ Harness names: `claude`, `codex`, `cursor`, `copilot`, `opencode`, `pi` (see `je
 | `report` | `task`, `worker` | a worker reported something other than done |
 | `review` | `task`, `worker` | a worker reported done and its diff is ready |
 | `question` | `worker`, `request_id` | a worker asked a question |
+| `approval` | `worker`, `request_id` | a worker wants an approval no policy rule matches, and `[workers] unmatched = "brain"` |
 | `worker_error` | `worker` | a worker's turn failed |
 | `exited` | `worker` | a worker's process ended before it reported |
 | `auth` | `worker` | a worker's harness needs a login |
@@ -131,6 +133,8 @@ These are the only things a brain can choose. For each consultation the loop wor
 | `split` | `task`, `into` (tasks as for `plan`) | drops `task` and plans these instead |
 | `prompt` | `worker`, `text` | sends a worker a new turn |
 | `answer` | `worker`, `answers` | answers a worker's question |
+| `allow` | `worker` | grants the approval the worker is waiting on |
+| `deny` | `worker` | refuses the approval the worker is waiting on |
 | `interrupt` | `worker` | stops a worker's current turn |
 | `handoff` | `worker`, `harness`, `prompt?` | continues the task on another harness, primed with the conversation |
 | `respawn` | `worker` | starts the harness again, resuming its conversation |

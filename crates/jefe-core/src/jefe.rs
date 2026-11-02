@@ -17,7 +17,7 @@ use crate::event::{Event, Stamped};
 use crate::ids::{AskId, ExecId, TaskId, WorkerId, worker_id};
 use crate::io::{Effect, HumanReply, Input, Purpose};
 use crate::job::{
-    Counters, Job, JobSpec, JobStatus, MergedTask, Report, Task, TaskKind, TaskSpec, TaskStatus,
+    Counters, Job, JobSpec, JobStatus, MergedTask, Report, Task, TaskKind, TaskSpec, TaskStatus, Unmatched,
 };
 use crate::merge;
 use crate::prompts::render;
@@ -942,13 +942,51 @@ impl Jefe {
             worker.handled.push(p.request_id.clone());
             match p.kind {
                 BlockKind::Permission => {
-                    if let Some(exec) = worker.reject(&p) {
-                        self.run(exec, Purpose::Input(w.clone()));
+                    let who = match self.spec.workers.unmatched {
+                        Unmatched::Human if !self.spec.attended => Unmatched::Deny,
+                        u => u,
+                    };
+                    if who == Unmatched::Deny {
+                        if let Some(exec) = worker.reject(&p) {
+                            self.run(exec, Purpose::Input(w.clone()));
+                        }
+                        self.emit(Event::PermissionDenied {
+                            worker: w.clone(),
+                            title: p.title.clone(),
+                        });
+                        continue;
                     }
-                    self.emit(Event::PermissionDenied {
+                    worker.phase = WorkerPhase::Blocked {
+                        kind: BlockKind::Permission,
+                        request_id: p.request_id.clone(),
+                    };
+                    self.emit(Event::WorkerBlocked {
                         worker: w.clone(),
+                        kind: BlockKind::Permission,
                         title: p.title.clone(),
                     });
+                    let trigger = Trigger::Approval {
+                        worker: w.clone(),
+                        request_id: p.request_id.clone(),
+                    };
+                    if who == Unmatched::Human {
+                        self.ask_human(
+                            trigger,
+                            format!("{w} asks to: {}. Allow it?", p.title),
+                            vec!["allow".to_owned(), "deny".to_owned()],
+                            1,
+                        );
+                    } else {
+                        let detail = serde_json::to_string(&p.native).unwrap_or_default();
+                        self.consult(
+                            trigger,
+                            Some(Focus::Approval {
+                                worker: w.clone(),
+                                title: p.title.clone(),
+                                detail,
+                            }),
+                        );
+                    }
                 }
                 BlockKind::Question => {
                     worker.phase = WorkerPhase::Blocked {
@@ -1767,6 +1805,8 @@ impl Jefe {
                 }
                 self.emit(Event::WorkerAnswered { worker, answers });
             }
+            Action::Allow { worker } => self.settle_approval(&worker, true),
+            Action::Deny { worker } => self.settle_approval(&worker, false),
             Action::Interrupt { worker } => {
                 let Some(w) = self.job.worker_mut(&worker) else {
                     return;
@@ -1817,27 +1857,11 @@ impl Jefe {
                 self.out.push(Effect::WakeIn { ms });
             }
             Action::AskHuman { question, options } => {
-                let ask = self.next_ask();
                 let questions = match &pending.focus {
                     Some(Focus::Question { questions, .. }) => questions.len(),
                     _ => 1,
                 };
-                self.book.human = Some(HumanAsk {
-                    ask: ask.clone(),
-                    trigger: trigger.clone(),
-                    questions,
-                });
-                self.job.status = JobStatus::NeedsHuman;
-                self.emit(Event::HumanAsked {
-                    ask: ask.clone(),
-                    question: question.clone(),
-                    options: options.clone(),
-                });
-                self.out.push(Effect::AskHuman {
-                    ask,
-                    question,
-                    options,
-                });
+                self.ask_human(trigger.clone(), question, options, questions);
             }
             Action::GiveUpTask { task, reason } => self.fail_task(&task, reason),
             Action::GiveUp { reason } => self.fail_job(reason),
@@ -1846,6 +1870,70 @@ impl Jefe {
     }
 
     // ---- the human ---------------------------------------------------------------------
+
+    fn ask_human(&mut self, trigger: Trigger, question: String, options: Vec<String>, questions: usize) {
+        let ask = self.next_ask();
+        self.book.human = Some(HumanAsk {
+            ask: ask.clone(),
+            trigger,
+            questions,
+        });
+        self.job.status = JobStatus::NeedsHuman;
+        self.emit(Event::HumanAsked {
+            ask: ask.clone(),
+            question: question.clone(),
+            options: options.clone(),
+        });
+        self.out.push(Effect::AskHuman {
+            ask,
+            question,
+            options,
+        });
+    }
+
+    /// Answers the approval `w` waits on.
+    fn settle_approval(&mut self, w: &WorkerId, allow: bool) {
+        let now = self.now;
+        let Some(worker) = self.job.worker_mut(w) else {
+            return;
+        };
+        let WorkerPhase::Blocked { request_id, .. } = worker.phase.clone() else {
+            return;
+        };
+        let Some(p) = worker.session().and_then(|s| {
+            s.permissions()
+                .iter()
+                .find(|p| p.request_id == request_id)
+                .cloned()
+        }) else {
+            worker.phase = WorkerPhase::Working;
+            return;
+        };
+        let exec = if allow {
+            acc_core::policy::option_for(acc_core::policy::Decision::Allow, &p.options)
+                .map(|o| o.id.clone())
+                .and_then(|id| worker.answer(&request_id, id))
+        } else {
+            worker.reject(&p)
+        };
+        worker.phase = WorkerPhase::Working;
+        worker.last_progress_ms = now;
+        if let Some(exec) = exec {
+            self.run(exec, Purpose::Input(w.clone()));
+        }
+        let title = p.title.clone();
+        self.emit(if allow {
+            Event::PermissionGranted {
+                worker: w.clone(),
+                title,
+            }
+        } else {
+            Event::PermissionDenied {
+                worker: w.clone(),
+                title,
+            }
+        });
+    }
 
     fn on_human(&mut self, reply: HumanReply) {
         match reply {
@@ -1910,6 +1998,14 @@ impl Jefe {
                 answers: vec![vec![text.to_owned()]; h.questions.max(1)],
             }),
             Trigger::Auth { worker } => Some(Action::Respawn {
+                worker: worker.clone(),
+            }),
+            Trigger::Approval { worker, .. } if yes || text.trim().eq_ignore_ascii_case("allow") => {
+                Some(Action::Allow {
+                    worker: worker.clone(),
+                })
+            }
+            Trigger::Approval { worker, .. } => Some(Action::Deny {
                 worker: worker.clone(),
             }),
             Trigger::Report { worker, .. }

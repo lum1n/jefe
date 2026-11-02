@@ -68,6 +68,22 @@ pub struct WorkerConfig {
     pub policy: Vec<Rule>,
     pub sandbox: Option<Sandbox>,
     pub launcher: Option<Launcher>,
+    /// Who decides approvals no policy rule matches.
+    #[serde(default)]
+    pub unmatched: Unmatched,
+}
+
+/// Who decides a worker's approval that no policy rule matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unmatched {
+    /// Reject it; the worker finds another way.
+    #[default]
+    Deny,
+    /// Ask the brain (`approval` trigger: `allow` or `deny`).
+    Brain,
+    /// Ask the human; deny when nobody is attending.
+    Human,
 }
 
 impl Default for WorkerConfig {
@@ -80,6 +96,7 @@ impl Default for WorkerConfig {
             policy: Vec::new(),
             sandbox: None,
             launcher: None,
+            unmatched: Unmatched::Deny,
         }
     }
 }

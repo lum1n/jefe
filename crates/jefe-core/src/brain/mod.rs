@@ -30,6 +30,8 @@ pub enum Trigger {
     Review { task: TaskId, worker: WorkerId },
     /// A worker asked a question.
     Question { worker: WorkerId, request_id: String },
+    /// A worker wants an approval no policy rule matches (`[workers] unmatched = "brain"`).
+    Approval { worker: WorkerId, request_id: String },
     /// A worker's turn failed.
     WorkerError { worker: WorkerId },
     /// A worker's process ended before it reported.
@@ -51,6 +53,7 @@ impl Trigger {
             Self::Report { .. } => "report",
             Self::Review { .. } => "review",
             Self::Question { .. } => "question",
+            Self::Approval { .. } => "approval",
             Self::WorkerError { .. } => "worker_error",
             Self::Exited { .. } => "exited",
             Self::Auth { .. } => "auth",
@@ -65,6 +68,7 @@ impl Trigger {
             Self::Report { worker, .. }
             | Self::Review { worker, .. }
             | Self::Question { worker, .. }
+            | Self::Approval { worker, .. }
             | Self::WorkerError { worker }
             | Self::Exited { worker }
             | Self::Auth { worker }
@@ -97,6 +101,14 @@ pub enum Action {
     Answer {
         worker: WorkerId,
         answers: Vec<Vec<String>>,
+    },
+    /// Grant the approval a worker waits on.
+    Allow {
+        worker: WorkerId,
+    },
+    /// Refuse the approval a worker waits on.
+    Deny {
+        worker: WorkerId,
     },
     /// Stop a worker's current turn.
     Interrupt {
@@ -150,6 +162,8 @@ pub enum ActionKind {
     Split,
     Prompt,
     Answer,
+    Allow,
+    Deny,
     Interrupt,
     Handoff,
     Respawn,
@@ -169,6 +183,8 @@ impl ActionKind {
             Self::Split => "split",
             Self::Prompt => "prompt",
             Self::Answer => "answer",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
             Self::Interrupt => "interrupt",
             Self::Handoff => "handoff",
             Self::Respawn => "respawn",
@@ -190,6 +206,8 @@ impl Action {
             Self::Split { .. } => ActionKind::Split,
             Self::Prompt { .. } => ActionKind::Prompt,
             Self::Answer { .. } => ActionKind::Answer,
+            Self::Allow { .. } => ActionKind::Allow,
+            Self::Deny { .. } => ActionKind::Deny,
             Self::Interrupt { .. } => ActionKind::Interrupt,
             Self::Handoff { .. } => ActionKind::Handoff,
             Self::Respawn { .. } => ActionKind::Respawn,
@@ -327,6 +345,12 @@ pub enum Focus {
     Question {
         worker: WorkerId,
         questions: Vec<QuestionView>,
+    },
+    /// What the worker wants to do: the harness's title and its raw request.
+    Approval {
+        worker: WorkerId,
+        title: String,
+        detail: String,
     },
     Error {
         worker: WorkerId,

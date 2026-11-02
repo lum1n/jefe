@@ -691,3 +691,110 @@ fn a_replacement_launches_when_its_predecessor_is_gone() {
     assert!(h.runs.contains(&Purpose::Launch(w(2))), "{:?}", h.runs);
     assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
 }
+
+/// Grants approvals; the rules decide everything else.
+struct AllowApprovals;
+
+impl Brain for AllowApprovals {
+    fn decide(&mut self, s: &Situation) -> Decision {
+        match &s.trigger {
+            jefe_core::Trigger::Approval { worker, .. } => {
+                assert!(
+                    matches!(&s.focus, Some(jefe_core::brain::Focus::Approval { title, .. }) if !title.is_empty()),
+                    "{:?}",
+                    s.focus
+                );
+                assert!(
+                    s.allowed.contains(&jefe_core::ActionKind::Allow),
+                    "{:?}",
+                    s.allowed
+                );
+                Decision {
+                    action: Action::Allow {
+                        worker: worker.clone(),
+                    },
+                    rationale: "scripted".to_owned(),
+                    confidence: 0.9,
+                    source: DecisionSource::Brain {
+                        harness: None,
+                        model: None,
+                    },
+                }
+            }
+            _ => RulesBrain.decide(s),
+        }
+    }
+}
+
+fn approval_job(unmatched: jefe_core::Unmatched, attended: bool, brain: Box<dyn Brain>) -> Host {
+    let mut s = spec();
+    s.workers.unmatched = unmatched;
+    s.attended = attended;
+    Host::new(s, brain).script(
+        1,
+        vec![
+            fixture("permission-deny-1.ndjson"),
+            fixture("permission-deny-2.ndjson"),
+            fixture("worker-result-only.ndjson"),
+        ],
+    )
+}
+
+#[test]
+fn with_unmatched_brain_the_brain_grants_an_approval() {
+    let mut h = approval_job(jefe_core::Unmatched::Brain, false, Box::new(AllowApprovals));
+    h.drain();
+    let kinds = h.kinds();
+    assert!(kinds.iter().any(|k| k == "permission_granted"), "{kinds:?}");
+    assert!(!kinds.iter().any(|k| k == "permission_denied"), "{kinds:?}");
+    assert!(
+        h.events.iter().any(|e| matches!(
+            e,
+            Event::Consulted {
+                trigger: jefe_core::Trigger::Approval { .. },
+                ..
+            }
+        )),
+        "{kinds:?}"
+    );
+    assert_eq!(h.finished, Some(JobStatus::Done), "{kinds:?}");
+}
+
+#[test]
+fn with_unmatched_brain_the_rules_still_deny() {
+    let mut h = approval_job(jefe_core::Unmatched::Brain, false, Box::new(RulesBrain));
+    h.drain();
+    assert!(h.has("permission_denied"), "{:?}", h.kinds());
+    assert!(!h.has("permission_granted"), "{:?}", h.kinds());
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+#[test]
+fn with_unmatched_human_the_human_decides() {
+    let mut h = approval_job(jefe_core::Unmatched::Human, true, Box::new(RulesBrain));
+    h.drain();
+    assert_eq!(h.human_asks.len(), 1, "{:?}", h.kinds());
+    assert!(h.human_asks[0].contains("Allow it?"), "{:?}", h.human_asks);
+    assert!(!h.events.iter().any(|e| matches!(
+        e,
+        Event::Consulted {
+            trigger: jefe_core::Trigger::Approval { .. },
+            ..
+        }
+    )));
+    h.feed(Input::Human(HumanReply::Answer {
+        ask: None,
+        text: "allow".to_owned(),
+    }));
+    h.drain();
+    assert!(h.has("permission_granted"), "{:?}", h.kinds());
+}
+
+#[test]
+fn with_unmatched_human_and_nobody_there_it_is_denied() {
+    let mut h = approval_job(jefe_core::Unmatched::Human, false, Box::new(RulesBrain));
+    h.drain();
+    assert!(h.human_asks.is_empty());
+    assert!(h.has("permission_denied"), "{:?}", h.kinds());
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}

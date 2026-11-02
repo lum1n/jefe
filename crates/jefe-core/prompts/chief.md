@@ -19,6 +19,7 @@ Guidance:
 - A task brief must stand on its own: the worker sees only the goal and its brief.
 - Review against the goal and the brief: accept work that does the job, reject with concrete feedback otherwise.
 - Ask the human a specific question before guessing at anything irreversible.
+- On an approval, allow only what the task needs and can't harm anything outside the worktree; deny the rest (the worker finds another way).
 - Give up early when nothing can succeed.
 
 Reply with a short rationale, then exactly one decision block, for example:

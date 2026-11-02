@@ -8,7 +8,7 @@ use acc_core::harness::Launcher;
 use acc_core::policy::Rule;
 use acc_core::sandbox::Sandbox;
 use anyhow::Context as _;
-use jefe_core::{Budget, WorkerConfig};
+use jefe_core::{Budget, Unmatched, WorkerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::hosts::{HostConfig, JobHost};
@@ -42,6 +42,8 @@ pub struct Workers {
     pub sandbox: Option<Sandbox>,
     /// Wrap or replace the harness executable.
     pub launcher: Option<Launcher>,
+    /// Who decides approvals no policy rule matches: deny, brain or human.
+    pub unmatched: Unmatched,
 }
 
 impl Default for Workers {
@@ -56,6 +58,7 @@ impl Default for Workers {
             policy: w.policy,
             sandbox: w.sandbox,
             launcher: w.launcher,
+            unmatched: w.unmatched,
         }
     }
 }
@@ -163,6 +166,9 @@ alternates = ["codex"]
 # Run workers in acc's sandbox:
 # sandbox = {}
 # launcher = { program = "/opt/claude/bin/claude" }
+# Approvals no policy rule matches: "deny", "brain" (the brain decides)
+# or "human" (asked; denied when nobody is attending).
+unmatched = "deny"
 
 [brain]
 kind = "rules"          # or "harness"
@@ -251,6 +257,7 @@ impl Config {
             policy: w.policy.clone(),
             sandbox: w.sandbox.clone(),
             launcher: w.launcher.clone(),
+            unmatched: w.unmatched,
         }
     }
 
@@ -299,6 +306,13 @@ mod tests {
         assert!(c.job_host(Some("nope")).is_err());
         assert!(Config::parse("[hosts.local]\nhost = \"x\"\n").is_err());
         assert!(Config::parse("[hosts.box]\nhost = \"x\"\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn unmatched_reaches_the_workers() {
+        let c = Config::parse("[workers]\nunmatched = \"brain\"\n").unwrap();
+        assert_eq!(c.worker_config().unmatched, Unmatched::Brain);
+        assert!(Config::parse("[workers]\nunmatched = \"maybe\"\n").is_err());
     }
 
     #[test]

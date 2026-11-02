@@ -189,6 +189,7 @@ pub fn describe(e: &Event, job: &JobId) -> Option<String> {
                 .join("; ")
         ),
         Event::PermissionDenied { worker, title } => format!("denied {}: {title}", w(worker)),
+        Event::PermissionGranted { worker, title } => format!("allowed {}: {title}", w(worker)),
         Event::WorkerReported { worker, task, result } => {
             let what = match result.status {
                 ResultStatus::Done => "done",

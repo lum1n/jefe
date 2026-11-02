@@ -79,6 +79,8 @@ fn every_event_action_and_trigger_is_documented() {
             ActionKind::Split,
             ActionKind::Prompt,
             ActionKind::Answer,
+            ActionKind::Allow,
+            ActionKind::Deny,
             ActionKind::Interrupt,
             ActionKind::Handoff,
             ActionKind::Respawn,

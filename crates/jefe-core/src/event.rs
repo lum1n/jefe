@@ -69,6 +69,11 @@ pub enum Event {
         worker: WorkerId,
         title: String,
     },
+    /// An approval no rule matched was granted by the brain or the human.
+    PermissionGranted {
+        worker: WorkerId,
+        title: String,
+    },
     WorkerReported {
         worker: WorkerId,
         task: TaskId,

@@ -26,6 +26,7 @@ fn base(trigger: &Trigger) -> &'static [ActionKind] {
         Trigger::Report { .. } => &[Prompt, Split, Handoff, AskHuman, GiveUpTask, GiveUp],
         Trigger::Review { .. } => &[Accept, Reject, AskHuman, GiveUpTask],
         Trigger::Question { .. } => &[Answer, AskHuman, Interrupt, GiveUpTask],
+        Trigger::Approval { .. } => &[Allow, Deny, AskHuman, GiveUpTask],
         Trigger::WorkerError { .. } => &[Prompt, Respawn, Handoff, GiveUpTask, GiveUp],
         Trigger::Exited { .. } => &[Respawn, Handoff, GiveUpTask, GiveUp],
         Trigger::Auth { .. } => &[AskHuman, Handoff, GiveUpTask, GiveUp],
@@ -115,6 +116,19 @@ pub fn validate(job: &Job, allowed: &[ActionKind], action: &Action, cx: Context<
             }
             if answers.is_empty() || answers.iter().any(|a| a.iter().all(|s| s.trim().is_empty())) {
                 return Err("give an answer to every question".to_owned());
+            }
+            Ok(())
+        }
+        Action::Allow { worker } | Action::Deny { worker } => {
+            let w = live_worker(job, worker)?;
+            if !matches!(
+                w.phase,
+                WorkerPhase::Blocked {
+                    kind: BlockKind::Permission,
+                    ..
+                }
+            ) {
+                return Err(format!("{worker} is not waiting for an approval"));
             }
             Ok(())
         }
@@ -309,6 +323,8 @@ mod tests {
                 worker: w(),
                 answers: vec![vec!["a".to_owned()]],
             },
+            ActionKind::Allow => Action::Allow { worker: w() },
+            ActionKind::Deny => Action::Deny { worker: w() },
             ActionKind::Interrupt => Action::Interrupt { worker: w() },
             ActionKind::Handoff => Action::Handoff {
                 worker: w(),
@@ -353,6 +369,10 @@ mod tests {
                 worker: w(),
             },
             Trigger::Question {
+                worker: w(),
+                request_id: "r".to_owned(),
+            },
+            Trigger::Approval {
                 worker: w(),
                 request_id: "r".to_owned(),
             },

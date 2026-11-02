@@ -106,6 +106,13 @@ fn candidates(s: &Situation) -> (Vec<Action>, &'static str) {
             });
             (out, "the human if there is one, else the first option")
         }
+        // The rules never grant what no policy rule allowed.
+        Trigger::Approval { worker, .. } => (
+            vec![Action::Deny {
+                worker: worker.clone(),
+            }],
+            "nothing allowed it",
+        ),
         Trigger::Report { task, worker } => {
             let status = match &s.focus {
                 Some(Focus::Report { result, .. }) => Some(result.status),
@@ -253,6 +260,8 @@ pub const ALL_KINDS: &[ActionKind] = &[
     ActionKind::Split,
     ActionKind::Prompt,
     ActionKind::Answer,
+    ActionKind::Allow,
+    ActionKind::Deny,
     ActionKind::Interrupt,
     ActionKind::Handoff,
     ActionKind::Respawn,

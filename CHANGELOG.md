@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `[workers] unmatched = "deny" | "brain" | "human"`: who decides approvals no policy rule matches. `brain` adds the `approval` trigger and the `allow` and `deny` actions (the rules brain always denies); `human` asks, and denies when nobody is attending. New event `permission_granted`.
+- A stalled worker can be respawned or handed off.
+- Restarts lose nothing: writes to a worker that were running when jefe died are written again if the worker stays silent for 30 s, and a replacement waiting for its predecessor to stop still launches.
+
 ## 0.1.0 (2026-11-02)
 
 - Protocol version 1 is frozen: [docs/PROTOCOL.md](docs/PROTOCOL.md) lists every envelope, event, trigger, action and control command, and a test fails when one is added without docs. [docs/EMBED.md](docs/EMBED.md) covers the binary, the crate and the sans-IO core.

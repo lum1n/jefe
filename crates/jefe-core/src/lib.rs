@@ -27,7 +27,7 @@ pub use event::{Event, Stamped};
 pub use ids::{AskId, ExecId, HostId, JobId, TaskId, WorkerId};
 pub use io::{Effect, HumanReply, Input, Purpose};
 pub use jefe::{Jefe, RESEND_AFTER_MS, RestoreError};
-pub use job::{Budget, JobSpec, JobStatus, Report, TaskStatus, WorkerConfig};
+pub use job::{Budget, JobSpec, JobStatus, Report, TaskStatus, Unmatched, WorkerConfig};
 
 /// Version of the JSON protocol jefe speaks when embedded. Consumers reject
 /// majors they don't support.
