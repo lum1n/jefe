@@ -260,3 +260,31 @@ async fn prepare_resume(
         first,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn repo_prompts_default_without_overrides() {
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(repo_prompts(repo.path()), Prompts::default());
+    }
+
+    #[test]
+    fn repo_prompts_override_each_prompt_independently() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".jefe/prompts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("worker.md"), "my worker").unwrap();
+        let p = repo_prompts(repo.path());
+        assert_eq!(p.worker, "my worker");
+        assert_eq!(p.chief, Prompts::default().chief);
+
+        // An empty file is still an override.
+        std::fs::write(dir.join("chief.md"), "").unwrap();
+        assert_eq!(repo_prompts(repo.path()).chief, "");
+    }
+}
