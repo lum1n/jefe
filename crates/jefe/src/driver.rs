@@ -210,6 +210,11 @@ impl Supervisor {
                 } => self.out.ask(&ask, &question, &options),
                 Effect::Emit(s) => {
                     self.store.event(&s)?;
+                    if let jefe_core::Event::WorkerReported { worker, .. } = &s.event
+                        && let Some(text) = self.jefe.job().worker(worker).and_then(|w| w.last_message())
+                    {
+                        self.store.worker_final(worker.as_str(), &text)?;
+                    }
                     self.out.event(&s);
                 }
                 Effect::WakeIn { ms } => {

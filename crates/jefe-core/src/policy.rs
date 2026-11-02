@@ -26,6 +26,9 @@ const WORKER_ALLOW: &[&str] = &[
     "git blame",
     "git grep",
     "git ls-files",
+    "git rev-parse",
+    // Listing remotes and their URLs; changing them is denied below.
+    "git remote",
     "git add",
     "git commit",
     "git merge",
@@ -78,7 +81,21 @@ const WORKER_ALLOW: &[&str] = &[
 
 /// Never for a worker: publishing and repository configuration stay with the
 /// human.
-const WORKER_DENY: &[&str] = &["git push", "gh", "git remote", "git config", "git worktree"];
+const WORKER_DENY: &[&str] = &[
+    "git push",
+    "gh",
+    "git config",
+    "git worktree",
+    "git remote add",
+    "git remote set-url",
+    "git remote remove",
+    "git remote rm",
+    "git remote rename",
+    "git remote set-head",
+    "git remote set-branches",
+    "git remote prune",
+    "git remote update",
+];
 
 /// Commands the brain may run while it looks around.
 const BRAIN_ALLOW: &[&str] = &[
@@ -159,6 +176,26 @@ mod tests {
         let extra = [shell(Decision::Allow, "git push")];
         assert_eq!(decide(worker_rules(&extra), "git push"), Some(Decision::Deny));
         assert_eq!(decide(worker_rules(&[]), "curl x"), None);
+    }
+
+    #[test]
+    fn workers_read_remotes_but_never_change_them() {
+        for read in [
+            "git remote get-url origin",
+            "git remote -v",
+            "git remote",
+            "git rev-parse HEAD",
+        ] {
+            assert_eq!(decide(worker_rules(&[]), read), Some(Decision::Allow), "{read}");
+        }
+        for write in [
+            "git remote add x y",
+            "git remote set-url origin z",
+            "git remote remove origin",
+            "git remote rename origin up",
+        ] {
+            assert_eq!(decide(worker_rules(&[]), write), Some(Decision::Deny), "{write}");
+        }
     }
 
     #[test]

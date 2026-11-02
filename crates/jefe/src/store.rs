@@ -1,6 +1,6 @@
 //! A job's directory: `job.json` (the latest snapshot), `events.ndjson`,
 //! `inputs.ndjson` (everything fed to the loop, for replay), `report.md`,
-//! `brain.json`, `host.json`, and `pid` while a jefe process drives it.
+//! `brain.json`, `host.json`, `workers/<id>/final.md`, and `pid` while a jefe process drives it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -79,6 +79,13 @@ impl Store {
             &self.dir.join("brain.json"),
             serde_json::to_string(&brain)?.as_bytes(),
         )
+    }
+
+    /// A worker's last message when it reports, as `workers/<id>/final.md`.
+    pub fn worker_final(&self, worker: &str, text: &str) -> anyhow::Result<()> {
+        let dir = self.dir.join("workers").join(worker);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        write_atomic(&dir.join("final.md"), text.as_bytes())
     }
 
     /// Which host the job runs on, for `attach`.

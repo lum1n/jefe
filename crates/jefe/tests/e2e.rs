@@ -229,6 +229,8 @@ fn a_goal_becomes_a_merged_commit() {
     for f in ["job.json", "events.ndjson", "inputs.ndjson", "report.md"] {
         assert!(dir.join(f).is_file(), "no {f}");
     }
+    let last = std::fs::read_to_string(dir.join("workers/jefe-e1-w1/final.md")).unwrap();
+    assert!(last.contains("```jefe-result"), "{last}");
     assert!(!dir.join("pid").exists(), "pid file left behind");
 
     let status = text(&env.jefe(&["status", "e1"]));
@@ -759,4 +761,46 @@ fn json_mode_speaks_protocol_v1() {
     let types = event_types(&lines);
     assert_eq!(types.first().map(String::as_str), Some("job_created"));
     assert_eq!(types.last().map(String::as_str), Some("job_cancelled"));
+}
+
+/// `jefe status --live` follows a running job to its end.
+#[test]
+fn status_live_follows_a_job_to_its_end() {
+    let env = Env::new();
+    std::fs::write(env.home().join("hold"), "").unwrap();
+    let job = env
+        .command(&["add hello", "--json", "--unattended", "--id", "l1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !env.home().join("started").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the worker never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let live = env
+        .command(&["status", "l1", "--live", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(env.home().join("go"), "").unwrap();
+    let out = live.wait_with_output().unwrap();
+    let mut job = job;
+    assert!(job.wait().unwrap().success());
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lines = events(&out.stdout);
+    assert_eq!(lines[0]["type"], "snapshot", "{lines:?}");
+    let types = event_types(&lines);
+    assert!(types.iter().any(|t| t == "merged"), "{types:?}");
+    assert_eq!(types.last().map(String::as_str), Some("job_done"), "{types:?}");
+    assert!(
+        !types.iter().any(|t| t == "job_created"),
+        "replayed old events: {types:?}"
+    );
 }

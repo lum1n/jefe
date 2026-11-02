@@ -4,6 +4,9 @@
 
 - `[workers] unmatched = "deny" | "brain" | "human"`: who decides approvals no policy rule matches. `brain` adds the `approval` trigger and the `allow` and `deny` actions (the rules brain always denies); `human` asks, and denies when nobody is attending. New event `permission_granted`.
 - A stalled worker can be respawned or handed off.
+- `jefe status --live` (`-f`) prints a job's events as they happen until it ends.
+- Each worker's last message when it reports is saved as `workers/<id>/final.md` in the job's directory.
+- Workers may run `git remote` (list, `-v`, `get-url`) and `git rev-parse` without asking; changing remotes stays denied.
 - Restarts lose nothing: writes to a worker that were running when jefe died are written again if the worker stays silent for 30 s, and a replacement waiting for its predecessor to stop still launches.
 
 ## 0.1.0 (2026-11-02)

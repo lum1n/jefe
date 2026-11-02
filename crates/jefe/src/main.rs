@@ -79,6 +79,9 @@ enum Command {
         job: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Keep printing the job's events as they happen, until it ends.
+        #[arg(long, short = 'f')]
+        live: bool,
     },
     /// List jobs, newest first.
     Jobs {
@@ -167,7 +170,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     };
     match command {
         Command::Run(args) => run_job(args),
-        Command::Status { job, json } => status(job, json),
+        Command::Status { job, json, live } => status(job, json, live),
         Command::Jobs { json } => jobs(json),
         Command::Attach { job, json } => {
             let report = block_on(jefe::resume(&job, mode(json), true, false))??;
@@ -296,8 +299,57 @@ fn str_of(v: &serde_json::Value) -> &str {
     v.as_str().unwrap_or("")
 }
 
-fn status(job: Option<String>, json: bool) -> anyhow::Result<i32> {
+fn status(job: Option<String>, json: bool, live: bool) -> anyhow::Result<i32> {
     let id = latest(job)?;
+    // Where the log ends now: `--live` prints what comes after the status.
+    let from = std::fs::metadata(store::Store::dir_for(&id).join("events.ndjson")).map_or(0, |m| m.len());
+    let code = print_status(&id, json)?;
+    if live { follow(&id, json, from) } else { Ok(code) }
+}
+
+/// Prints job `id`'s events from byte `from` of its log as they are written,
+/// until the job ends (its exit code) or nobody drives it any more (0).
+fn follow(id: &str, json: bool, from: u64) -> anyhow::Result<i32> {
+    use std::io::{BufRead as _, Seek as _};
+
+    let path = store::Store::dir_for(id).join("events.ndjson");
+    let mut file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    file.seek(std::io::SeekFrom::Start(from))?;
+    let mut reader = std::io::BufReader::new(file);
+    let out = jefe::Output::new(mode(json), jefe_core::JobId(id.to_owned()));
+    let mut line = String::new();
+    let mut idle = 0;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n > 0 && line.ends_with('\n') {
+            idle = 0;
+            let stamped: jefe_core::Stamped =
+                serde_json::from_str(line.trim_end()).with_context(|| format!("in {}", path.display()))?;
+            out.event(&stamped);
+            if let Some(status) = stamped.event.terminal() {
+                return Ok(jefe::output::exit_code(status));
+            }
+            continue;
+        }
+        if n > 0 {
+            // A line still being written: read it again whole.
+            reader.seek_relative(-(n as i64))?;
+        }
+        if store::driver_pid(id).is_none() {
+            idle += 1;
+            // Give a just-started or just-ended driver a moment.
+            if idle > 6 {
+                eprintln!("jefe: no jefe process is driving job {id}; `jefe attach {id}` resumes it");
+                return Ok(0);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn print_status(id: &str, json: bool) -> anyhow::Result<i32> {
+    let id = id.to_owned();
     let job = read_job(&id)?;
     let driver = store::driver_pid(&id);
     if json {
