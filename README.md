@@ -28,7 +28,7 @@ With `--host <name>`, the workers, the brain and the merges run on a host from `
 
 With `--brain harness` (or `[brain] kind = "harness"`), each judgment point (plan, review, questions, failures, wrap-up) is a one-shot session on your own harness in the repository, under a read-only policy, inside acc's read-only sandbox unless `[brain] sandbox = false`. It answers with one action from the allowed set, which jefe checks before acting; when it fails, times out or gives no valid decision twice, the rules decide. Each exchange is saved to `brain/<ask>.md` in the job's directory.
 
-Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.local/state/jefe/jobs/<id>/` (`$JEFE_STATE_DIR`): `job.json`, `events.ndjson`, `inputs.ndjson`, `report.md`, `brain.json`, `host.json` and each worker's last message in `workers/<id>/final.md`. You can override prompts per local repository in `.jefe/prompts/{worker,chief}.md`.
+Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.local/state/jefe/jobs/<id>/` (`$JEFE_STATE_DIR`): `job.json`, `events.ndjson`, `inputs.ndjson`, `report.md`, `brain.json`, `host.json` and each worker's last message in `workers/<id>/final.md`. You can override prompts per repository in `.jefe/prompts/{worker,chief}.md`, on SSH hosts too.
 
 ## Layout
 

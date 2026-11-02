@@ -68,7 +68,7 @@ pub fn new_job_id() -> String {
     id
 }
 
-/// Overrides from `<repo>/.jefe/prompts/{worker,chief}.md`.
+/// Overrides from `<repo>/.jefe/prompts/{worker,chief}.md` in a local repository.
 pub fn repo_prompts(repo: &std::path::Path) -> Prompts {
     let mut p = Prompts::default();
     let dir = repo.join(".jefe/prompts");
@@ -79,6 +79,26 @@ pub fn repo_prompts(repo: &std::path::Path) -> Prompts {
         p.chief = text;
     }
     p
+}
+
+/// Overrides from `<repo>/.jefe/prompts/{worker,chief}.md` on `host`, for
+/// repositories this machine can't read directly.
+pub async fn host_prompts(host: &acc_ssh::Host, repo: &str) -> anyhow::Result<Prompts> {
+    let mut p = Prompts::default();
+    for (name, slot) in [("worker", &mut p.worker), ("chief", &mut p.chief)] {
+        let q = acc_core::shell::quote(&format!("{repo}/.jefe/prompts/{name}.md"));
+        // A leading `y` tells a present (maybe empty) file from a missing one.
+        let script = format!("if [ -f {q} ]; then printf y; cat {q}; fi");
+        let out = host
+            .exec(&script, &[])
+            .await
+            .and_then(acc_ssh::Output::ok)
+            .with_context(|| format!("reading {name}.md on the host"))?;
+        if let Some(text) = out.stdout_str().strip_prefix('y') {
+            *slot = text.to_owned();
+        }
+    }
+    Ok(p)
 }
 
 fn runner(brain: Option<HarnessBrain>) -> BrainRunner {

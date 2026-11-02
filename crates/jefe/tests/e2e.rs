@@ -396,6 +396,21 @@ fn a_job_runs_on_an_ssh_host_and_attach_finds_it_again() {
     ));
     std::fs::write(env.root.join("jefe.toml"), config).unwrap();
     let repo = env.repo().to_string_lossy().into_owned();
+    // A chief prompt override in the repository, read over SSH.
+    std::fs::create_dir_all(env.repo().join(".jefe/prompts")).unwrap();
+    std::fs::write(
+        env.repo().join(".jefe/prompts/chief.md"),
+        "CUSTOM CHIEF\nWhy you are asked: {{trigger}}\n{{situation}}\n{{actions}}\n",
+    )
+    .unwrap();
+    sh(
+        &env.repo(),
+        &format!(
+            "HOME={} git add .jefe && HOME={} git commit -qm prompts",
+            env.home().display(),
+            env.home().display()
+        ),
+    );
 
     let out = env.jefe(&["add hello", "--host", "nope", "--repo", &repo]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -481,6 +496,9 @@ fn a_job_runs_on_an_ssh_host_and_attach_finds_it_again() {
     assert!(env.acc_dir_is_empty("s"), "session left behind");
     let log = std::fs::read_to_string(env.root.join("sshd/sshd.log")).unwrap();
     assert!(log.contains("Accepted publickey"), "{log}");
+    let prompts = std::fs::read_to_string(env.home().join("brain-prompts")).unwrap();
+    assert!(prompts.contains("CUSTOM CHIEF"), "{prompts}");
+    assert!(!prompts.contains("You are the brain of jefe"), "{prompts}");
 }
 
 /// Protocol v1 as an embedder sees it: the envelope, every control command,

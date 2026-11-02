@@ -217,7 +217,7 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
             .with_context(|| format!("no repository at {}", repo.display()))?;
         (repo.to_string_lossy().into_owned(), jefe::repo_prompts(&repo))
     } else {
-        // The path is the host's; nothing here can check it. Preflight does.
+        // The path is the host's: preflight checks it there.
         let repo = a
             .repo
             .with_context(|| format!("say which repository on host {}: --repo /abs/path", host.name))?;
@@ -225,7 +225,14 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         if !repo.starts_with('/') {
             anyhow::bail!("--repo must be an absolute path on host {}", host.name);
         }
-        (repo, jefe_core::prompts::Prompts::default())
+        let prompts = block_on(async {
+            let conn = host.open()?;
+            conn.connect()
+                .await
+                .with_context(|| format!("connecting to host {}", host.name))?;
+            jefe::host_prompts(&conn, &repo).await
+        })??;
+        (repo, prompts)
     };
     let id = a.id.unwrap_or_else(jefe::new_job_id);
     if !jefe_core::ids::valid_job_id(&id) {
