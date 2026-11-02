@@ -6,7 +6,7 @@ It runs on [acc](https://github.com/lum1n/acc), so the agents can be Claude Code
 
 jefe talks prose when you run it yourself and NDJSON (`--json`) when another program embeds it. The supervision loop is a sans-IO crate, `jefe-core`, that other programs can drive directly.
 
-**Status:** early. The workspace builds; the loop is being written. See `CHANGELOG.md`.
+**Status:** early. `jefe-core`'s loop works against a scripted host; the `jefe` binary doesn't run jobs yet. See `CHANGELOG.md`.
 
 ```
 jefe capabilities --json

@@ -1,0 +1,2 @@
+{"type": "assistant", "message": {"id": "msg_9", "type": "message", "role": "assistant", "model": "fake", "content": [{"type": "text", "text": "Still no block."}]}, "session_id": "fake-1"}
+{"type": "result", "subtype": "success", "is_error": false, "result": "x", "session_id": "fake-1", "num_turns": 1, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}}
