@@ -29,7 +29,7 @@ Error codes:
 - `bad_control`: a stdin line wasn't a valid control command. It is ignored and the job goes on.
 - `fatal`: jefe itself failed (bad arguments or config, no repository, unreachable host, I/O). Nothing follows.
 
-Exit codes: `0` done, `1` jefe failed (`fatal`), `2` failed or gave up, `3` cancelled.
+Exit codes: `0` done, `1` jefe failed (`fatal`), `2` failed or gave up, `3` cancelled, `4` the job ended in a non-final state (planning, running or needs a human).
 
 ## Control commands (stdin)
 
