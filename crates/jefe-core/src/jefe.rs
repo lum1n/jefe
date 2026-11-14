@@ -944,6 +944,11 @@ impl Jefe {
                 BlockKind::Permission => {
                     let who = match self.spec.workers.unmatched {
                         Unmatched::Human if !self.spec.attended => Unmatched::Deny,
+                        // One human question is open at a time: a second one would
+                        // replace the first and leave its worker blocked for good.
+                        Unmatched::Human if self.book.human.is_some() || self.book.finishing => {
+                            Unmatched::Deny
+                        }
                         u => u,
                     };
                     if who == Unmatched::Deny {
