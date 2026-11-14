@@ -200,4 +200,27 @@ mod tests {
             assert_eq!(serde_json::from_value::<Input>(v).unwrap(), input);
         }
     }
+
+    #[test]
+    fn worker_final_writes_and_overwrites_under_the_worker_dir() {
+        let dir = std::env::temp_dir().join(format!("jefe-store-final-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store {
+            events: File::create(dir.join("events.ndjson")).unwrap(),
+            inputs: File::create(dir.join("inputs.ndjson")).unwrap(),
+            dir: dir.clone(),
+        };
+        store.worker_final("w1", "first").unwrap();
+        let path = dir.join("workers/w1/final.md");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        store.worker_final("w1", "second").unwrap();
+        store.worker_final("w2", "other").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(
+            fs::read_to_string(dir.join("workers/w2/final.md")).unwrap(),
+            "other"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
