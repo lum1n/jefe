@@ -199,6 +199,24 @@ mod tests {
     }
 
     #[test]
+    fn workers_cannot_change_remotes_by_any_subcommand() {
+        for write in [
+            "git remote rm origin",
+            "git remote set-head origin main",
+            "git remote set-branches origin main",
+            "git remote prune origin",
+            "git remote update",
+        ] {
+            assert_eq!(decide(worker_rules(&[]), write), Some(Decision::Deny), "{write}");
+        }
+        let extra = [shell(Decision::Allow, "git remote add")];
+        assert_eq!(
+            decide(worker_rules(&extra), "git remote add x y"),
+            Some(Decision::Deny)
+        );
+    }
+
+    #[test]
     fn the_brain_only_reads() {
         assert_eq!(decide(brain_rules(), "git log -3"), Some(Decision::Allow));
         assert_eq!(decide(brain_rules(), "cargo test"), None);
