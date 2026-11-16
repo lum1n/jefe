@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- acc moves to its v0.5.0 release tag (the same spec sessh-desktop and sessh-swift use), so embedders share one acc-core.
 - `[workers] unmatched = "deny" | "brain" | "human"`: who decides approvals no policy rule matches. `brain` adds the `approval` trigger and the `allow` and `deny` actions (the rules brain always denies); `human` asks, and denies when nobody is attending. New event `permission_granted`.
 - A stalled worker can be respawned or handed off.
 - Library: `jefe::start_embedded` / `resume_embedded` run a job in the caller's runtime with protocol messages as typed `jefe::Message` values and a `jefe::Control` handle. Nothing is printed, and stdin and signals are left alone.

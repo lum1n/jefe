@@ -13,10 +13,11 @@ publish = false
 
 [workspace.dependencies]
 jefe-core = { path = "crates/jefe-core" }
-# Pinned: acc is young and moves fast. Bump deliberately; acc calls live in
+# Pinned to a release tag, the same one sessh pins, so one acc-core is built
+# when jefe is embedded. Bump deliberately; acc calls live in
 # jefe-core's worker.rs and merge.rs and jefe's brain.rs only.
-acc-core = { git = "https://github.com/lum1n/acc", rev = "22f3466a30a21a75e8a0d7fc7d8906fa9e24ac08" }
-acc-ssh = { git = "https://github.com/lum1n/acc", rev = "22f3466a30a21a75e8a0d7fc7d8906fa9e24ac08" }
+acc-core = { git = "https://github.com/lum1n/acc", tag = "v0.5.0" }
+acc-ssh = { git = "https://github.com/lum1n/acc", tag = "v0.5.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
