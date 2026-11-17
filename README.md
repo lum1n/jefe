@@ -43,6 +43,7 @@ Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.lo
 
 - `crates/jefe-core`: jobs, tasks, workers, the supervision loop and the `Brain` interface. No I/O; builds for `wasm32-unknown-unknown`.
 - `crates/jefe`: the host. It runs the loop's effects through acc and provides the `jefe` binary.
+- `crates/jefe-ffi`: UniFFI bindings (Swift, Kotlin) for apps that run the loop's effects over their own transport.
 
 ## License
 

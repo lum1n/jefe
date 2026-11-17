@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/jefe-core", "crates/jefe"]
+members = ["crates/jefe-core", "crates/jefe", "crates/jefe-ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "io-std", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1"
+uniffi = "0.32"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
