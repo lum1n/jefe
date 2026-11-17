@@ -1449,6 +1449,29 @@ fn the_cost_cap_ends_the_job() {
 // ---- hosted ------------------------------------------------------------------------------
 
 #[test]
+fn opening_a_finished_job_releases_its_lease_at_once() {
+    use jefe_core::Hosted;
+    let mut h = Host::new(spec(), Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(h.finished, Some(JobStatus::Done));
+    let snap = h.jefe.snapshot();
+    let (hosted, effects) = Hosted::open(&snap, &[], "phone", 9_000).unwrap();
+    let purposes: Vec<Purpose> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Run { purpose, .. } => Some(purpose.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(purposes.contains(&Purpose::Save), "{purposes:?}");
+    assert!(
+        !purposes.contains(&Purpose::Lease),
+        "nothing to renew: {purposes:?}"
+    );
+    let _ = hosted;
+}
+
+#[test]
 fn a_hosted_job_saves_and_renews_its_lease_and_stops_when_it_is_taken() {
     use jefe_core::Hosted;
     let (mut hosted, effects) = Hosted::start(spec(), "desk", 1_000);

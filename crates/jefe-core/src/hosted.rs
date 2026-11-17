@@ -69,8 +69,12 @@ impl Hosted {
         now_ms: u64,
     ) -> Result<(Self, Vec<Effect>), RestoreError> {
         let (jefe, effects) = Jefe::restore(snapshot, specs, now_ms)?;
+        let finished = jefe.is_finished();
         let mut h = Self::wrap(jefe, client, true, now_ms);
         h.lease_due = Some(now_ms.saturating_add(LEASE_RENEW_MS));
+        // A job that was over when it was opened has nothing to drive: its
+        // state is saved once more (a look, not a change) and the lease let go.
+        h.finished = finished;
         let out = h.after(effects);
         Ok((h, out))
     }

@@ -25,9 +25,17 @@ fn claude_brain_plans_and_a_claude_worker_delivers() {
         .status()
         .unwrap();
     assert!(ok.success());
+    // A Claude orchestrator in one session for the job; workers on the
+    // harness `JEFE_LIVE_WORKERS` names (default claude).
+    let workers = std::env::var("JEFE_LIVE_WORKERS").unwrap_or_else(|_| "claude".to_owned());
+    let model = std::env::var("JEFE_LIVE_WORKER_MODEL")
+        .map(|m| format!("model = \"{m}\"\n"))
+        .unwrap_or_default();
     std::fs::write(
         tmp.path().join("jefe.toml"),
-        "[brain]\nkind = \"harness\"\nsandbox = false\n",
+        format!(
+            "[workers]\nharness = \"{workers}\"\n{model}\n[orchestrator]\nkind = \"session\"\nharness = \"claude\"\nsandbox = false\n\n[review]\nby = \"both\"\n"
+        ),
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_jefe"))
