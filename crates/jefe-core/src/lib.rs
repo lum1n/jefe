@@ -11,23 +11,31 @@
 
 pub mod brain;
 pub mod event;
+pub mod hosted;
 pub mod ids;
 pub mod io;
 mod jefe;
 pub mod job;
 pub mod merge;
 pub mod policy;
+pub mod preset;
 pub mod prompts;
 pub mod result;
 pub mod rules;
+pub mod store;
 pub mod worker;
 
 pub use brain::{Action, ActionKind, Brain, Decision, DecisionSource, RulesBrain, Situation, Trigger};
 pub use event::{Event, Stamped};
+pub use hosted::Hosted;
 pub use ids::{AskId, ExecId, HostId, JobId, TaskId, WorkerId};
 pub use io::{Effect, HumanReply, Input, Purpose};
 pub use jefe::{Jefe, RESEND_AFTER_MS, RestoreError};
-pub use job::{Budget, JobSpec, JobStatus, Report, TaskStatus, Unmatched, WorkerConfig};
+pub use job::{
+    Access, BrainKind, BrainSpec, Budget, JobSpec, JobStatus, Report, ResolvedWorker, ReviewBy, RoleConfig,
+    TaskStatus, Unmatched, WorkerConfig,
+};
+pub use preset::TeamPreset;
 
 /// Version of the JSON protocol jefe speaks when embedded. Consumers reject
 /// majors they don't support.

@@ -22,23 +22,23 @@ For tests, point `[workers] launcher` and `[brain] launcher` at scripts that spe
 
 ## 2. The `jefe` crate
 
-`jefe::start_embedded(spec, host, brain)` runs the supervisor in your tokio runtime. It prints nothing and reads neither stdin nor signals. You get back an `Embedded`:
+`jefe::start_embedded(spec, host, state)` runs the supervisor in your tokio runtime. It prints nothing and reads neither stdin nor signals. You get back an `Embedded`:
 
 - `messages`: an unbounded receiver of `jefe::Message`. These are the protocol's envelopes as values (`Hello`, `Event(Stamped)`, `Ask`, `Snapshot`, `Error`, `Bye`), and they serialize to exactly the lines `--json` prints.
-- `control`: a `jefe::Control` with `answer(ask, text)`, `nudge(text)`, `cancel()` and `status()`. It is cheap to clone.
+- `control`: a `jefe::Control` with `answer(ask, text)`, `nudge(text)`, `message(text, consult)`, `consult_now()`, `cancel()` and `status()`. It is cheap to clone.
 - `done`: a `JoinHandle` that resolves to the job's `Report`.
 
 ```rust
-let mut spec = jefe_core::JobSpec::new("my-job-17", "add a --version flag", "/src/proj");
-spec.workers = jefe::config::Config::load(&path)?.worker_config();
-let mut job = jefe::start_embedded(spec, jefe::JobHost::local(), None).await?;
+let config = jefe::config::Config::load(&path)?;
+let mut spec = config.job_spec("my-job-17", "add a --version flag", "/src/proj");
+let mut job = jefe::start_embedded(spec, jefe::JobHost::local(), jefe::StateMode::Local).await?;
 while let Some(m) = job.messages.recv().await {
-    if let jefe::Message::Ask { ask, .. } = &m { job.control.answer(Some(ask.clone()), "yes"); }
+    if let jefe::Message::Ask { ask, .. } = &m { job.control.answer(Some(ask.clone()), "approve"); }
 }
 let report = job.done.await??;
 ```
 
-Pass `Some(HarnessBrain { … })` for a harness brain or `None` for the rules. For an SSH host, use `Config::job_host(name)`. `jefe::resume_embedded(id)` picks up a job whose driver died. Job state still goes to `JEFE_STATE_DIR` (default `~/.local/state/jefe`), so the CLI's `status`, `attach` and `stop` work on embedded jobs too.
+The orchestrator is part of `spec.brain` (`[orchestrator]` in the config): the rules, a fresh harness session per judgment point, or one session for the whole job. For an SSH host, use `Config::job_host(name)`. `jefe::resume_embedded(id)` picks up a job whose driver died. Job state goes to `JEFE_STATE_DIR` (default `~/.local/state/jefe`), so the CLI's `status`, `attach` and `stop` work on embedded jobs too; with `StateMode::Host` it is also kept on the job's host (below).
 
 `jefe::start` and `jefe::resume` are the CLI's versions: they print prose or protocol lines to stdout.
 
@@ -57,8 +57,8 @@ let effects = jefe.step(input, now_ms);
 | `Run { id, host, exec, purpose }` | run `exec.script` with `exec.stdin` on `host` (an acc-ssh `Host::exec`, or anything that runs POSIX `sh`), then `Input::ExecDone { id, code, stdout, stderr }`. Use `code: -1` if it couldn't run. |
 | `Follow { worker, host, offset }` | stream the worker's acc log from `offset` as `Input::Bytes`, and its end as `Input::LogEnded` (acc-ssh's `Detached::attach`) |
 | `Unfollow { worker }` | stop that stream |
-| `Consult { ask, situation }` | ask a brain, then send `Input::Decided { ask, decision }` or `Input::BrainFailed { ask, why }`. `RulesBrain.decide(&situation)` answers at once. |
-| `AskHuman { ask, question, options }` | eventually send `Input::Human(HumanReply::Answer { … })` |
+| `Consult { ask, situation }` | ask a brain, then send `Input::Decided { ask, decision }` or `Input::BrainFailed { ask, why }`. `RulesBrain.decide(&situation)` answers at once. Only sent with `spec.brain.kind == Rules`: the other kinds launch and drive the orchestrator's own acc session through `Run` and `Follow` (its id is `jefe-<job>-b<n>`; `Follow.worker` then names it). |
+| `AskHuman { ask, question, options, kind }` | eventually send `Input::Human(HumanReply::Answer { … })`. `kind` is `Some("plan")` when the plan waits for approval. |
 | `Emit(stamped)` | show or store the event |
 | `WakeIn { ms }` | send `Input::Tick` after `ms` |
 | `Finished { status, report }` | done; nothing is left running |
@@ -68,3 +68,11 @@ Also send `Input::Tick` at `jefe.next_deadline()` (or every few seconds) so stal
 The loop is deterministic for a given sequence of inputs and clock readings. jefe's binary logs every input to `inputs.ndjson`, so a job can be replayed.
 
 The brain never runs anything. It returns one `Decision` naming one action, and `rules::validate` checks it against `situation.allowed`. A refused decision is retried once, and then the rules decide.
+
+### Roles and presets
+
+`spec.roles` changes or adds to the built-in roles (`jefe_core::job::builtin_roles()`: explorer, researcher, implementor, tester, reviewer); `spec.resolve(role)` is what a worker of that role runs with. `jefe_core::TeamPreset` is one camelCase JSON shape for "who orchestrates, who works, in which roles, within what budget" that the CLI (`jefe preset`), the desktop app and the iOS app share; `preset.apply(&mut spec)` writes it into a spec.
+
+### State on the host, for many clients
+
+`jefe_core::Hosted` wraps `Jefe` and keeps the job's state on the job's host, so a desktop, a phone or the CLI can pick the same job up: `jobs/<id>/{job.json,events.ndjson,meta,lease,workers/<id>/final.md}` under `$JEFE_STATE_DIR` (default `$XDG_STATE_HOME/jefe`, else `~/.local/state/jefe`) **on the host**. It adds `Run` effects with `Purpose::Save` (debounced a second), `Purpose::Lease` (renewed every 10 s, 30 s TTL) and `Purpose::Release` to the loop's stream, so a host that runs effects for `Jefe` runs them for `Hosted` without more code. `Hosted::start(spec, client, now)` begins a job; to pick one up, run `store::lease_exec` (and check `parse_lease(..).ok`), then `store::load_exec` and `Hosted::open(snapshot, specs, client, now)`. `store::list_exec` + `parse_list` list the host's jobs with their holder. When another client takes the lease, `Hosted` emits `lease_lost` and stops driving; workers keep going in their acc sessions and decisions wait for the next client. `Hosted::release` gives the lease up on purpose (an app going to the background). The CLI does this with `--state host`.

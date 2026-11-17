@@ -7,8 +7,8 @@
 mod common;
 
 use common::Env;
-use jefe::{JobHost, Message};
-use jefe_core::{Event, JobSpec, JobStatus};
+use jefe::{JobHost, Message, StateMode};
+use jefe_core::{Event, JobStatus};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_embedded_job_streams_values_and_takes_control() {
@@ -22,14 +22,21 @@ async fn an_embedded_job_streams_values_and_takes_control() {
     }
     std::fs::write(env.home().join("hold"), "").unwrap();
     let config = jefe::config::Config::load(&env.root.join("jefe.toml")).unwrap();
-    let mut spec = JobSpec::new("m1", "add hello", env.repo().to_str().unwrap());
-    spec.workers = config.worker_config();
+    let mut spec = config.job_spec("m1", "add hello", env.repo().to_str().unwrap());
     spec.attended = true;
+    spec.approve_plan = None;
 
-    let mut job = jefe::start_embedded(spec, JobHost::local(), None).await.unwrap();
+    let mut job = jefe::start_embedded(spec, JobHost::local(), StateMode::Local)
+        .await
+        .unwrap();
     let mut seen = Vec::new();
-    // Ask for a snapshot and nudge once the worker is at work, then release it.
+    // Approve the plan, then ask for a snapshot and nudge once the worker is
+    // at work, and release it.
     while let Some(m) = job.messages.recv().await {
+        if let Message::Ask { ask, kind, .. } = &m {
+            assert_eq!(kind.as_deref(), Some("plan"));
+            job.control.answer(Some(ask.clone()), "approve");
+        }
         if let Message::Event(s) = &m
             && matches!(s.event, Event::WorkerSpawned { .. })
         {
@@ -49,6 +56,10 @@ async fn an_embedded_job_streams_values_and_takes_control() {
     assert!(
         matches!(&seen[0], Message::Hello { version: 1, job, .. } if job.as_str() == "m1"),
         "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, Message::Event(s) if s.event == Event::PlanApproved))
     );
     assert_eq!(
         seen.last(),

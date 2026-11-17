@@ -20,7 +20,13 @@ while IFS= read -r line; do
       fi
       printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-1","cwd":"/","model":"fake","tools":[],"permissionMode":"acceptEdits"}'
       branch=$(printf '%s' "$line" | grep -o 'Run `git merge acc/[A-Za-z0-9_-]*' | head -1 | sed 's/.*merge //')
+      result='{\"status\":\"done\",\"summary\":\"Added hello.txt\"}'
       case "$line" in
+        *'Your role: reviewer'*)
+          printf '%s\n' "$line" >> "$HOME/reviewer-prompts"
+          result='{\"status\":\"done\",\"verdict\":\"accept\",\"summary\":\"Matches the brief.\"}' ;;
+        *'Your role: explorer'*)
+          result='{\"status\":\"done\",\"summary\":\"hello.txt goes at the root.\"}' ;;
         *'Run `git merge acc/'*)
           git merge -q "$branch" >/dev/null 2>&1
           printf 'a\nb\n' > hello.txt
@@ -29,7 +35,7 @@ while IFS= read -r line; do
         *'Your task: Write B'*) echo b > hello.txt; git add hello.txt && git commit -qm "Write b" ;;
         *) echo hello > hello.txt; git add hello.txt && git commit -qm "Add hello.txt" ;;
       esac
-      printf '%s\n' '{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","model":"fake","content":[{"type":"text","text":"Added it.\n\n```jefe-result\n{\"status\":\"done\",\"summary\":\"Added hello.txt\"}\n```"}]},"session_id":"fake-1"}'
+      printf '%s%s%s\n' '{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","model":"fake","content":[{"type":"text","text":"Added it.\n\n```jefe-result\n' "$result" '\n```"}]},"session_id":"fake-1"}'
       printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Added it.","session_id":"fake-1","num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":10,"output_tokens":5}}'
       ;;
   esac
@@ -90,8 +96,15 @@ impl Env {
     /// A temporary `$HOME` with a git identity, a repository on `main`, the
     /// fake harness and a config pointing at it.
     pub fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        // `JEFE_E2E_KEEP=1` keeps the directory for a look after a failure.
+        let tmp = tempfile::Builder::new()
+            .disable_cleanup(std::env::var_os("JEFE_E2E_KEEP").is_some())
+            .tempdir()
+            .unwrap();
         let root = tmp.path().canonicalize().unwrap();
+        if std::env::var_os("JEFE_E2E_KEEP").is_some() {
+            eprintln!("e2e env kept at {}", root.display());
+        }
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
@@ -114,17 +127,30 @@ impl Env {
         let brain = root.join("bin/brain");
         std::fs::write(&brain, FAKE_BRAIN).unwrap();
         sh(&root, &format!("chmod +x {} {}", fake.display(), brain.display()));
+        let env = Self { _tmp: tmp, root };
+        env.config("");
+        env
+    }
+
+    /// Writes `jefe.toml`: the fakes, the brain reviewing alone and no plan
+    /// approval (so `--json` runs don't wait), plus `extra` sections.
+    pub fn config(&self, extra: &str) {
+        self.config_with("brain", false, extra);
+    }
+
+    /// [`Env::config`] with `[review] by` and `[plan] approve` as given.
+    pub fn config_with(&self, review_by: &str, approve: bool, extra: &str) {
         std::fs::write(
-            root.join("jefe.toml"),
+            self.root.join("jefe.toml"),
             format!(
                 "[workers]\nharness = \"claude\"\nlauncher = {{ program = \"{}\" }}\n\n\
-                 [brain]\nsandbox = false\ntimeout_secs = 30\nlauncher = {{ program = \"{}\" }}\n",
-                fake.display(),
-                brain.display()
+                 [brain]\nsandbox = false\ntimeout_secs = 30\nlauncher = {{ program = \"{}\" }}\n\n\
+                 [review]\nby = \"{review_by}\"\n\n[plan]\napprove = {approve}\n{extra}",
+                self.root.join("bin/claude").display(),
+                self.root.join("bin/brain").display()
             ),
         )
         .unwrap();
-        Self { _tmp: tmp, root }
     }
 
     pub fn home(&self) -> PathBuf {
@@ -149,12 +175,31 @@ impl Env {
     }
 
     pub fn jefe(&self, args: &[&str]) -> Output {
+        // With `JEFE_E2E_KEEP`, jefe's diagnostics show in the test output.
+        let stderr = if std::env::var_os("JEFE_E2E_KEEP").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        };
         let mut child = self
             .command(args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .unwrap();
+        // Drain the pipes while waiting: a job's output outgrows the pipe
+        // buffer, and jefe would block on it.
+        fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut out);
+                }
+                out
+            })
+        }
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
         let start = Instant::now();
         while child.try_wait().unwrap().is_none() {
             if start.elapsed() > Duration::from_secs(120) {
@@ -163,7 +208,12 @@ impl Env {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        child.wait_with_output().unwrap()
+        let status = child.wait().unwrap();
+        Output {
+            status,
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        }
     }
 
     pub fn acc_dir_is_empty(&self, sub: &str) -> bool {

@@ -62,7 +62,7 @@ fn prose_mode_reads_like_a_report() {
     let out = env.jefe(&["add hello", "--unattended", "--id", "p1"]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(0), "{t}");
-    assert!(t.contains("w1 (claude) started on t1"), "{t}");
+    assert!(t.contains("w1 (claude, implementor) started on t1"), "{t}");
     assert!(t.contains("merged t1 as"), "{t}");
     assert!(t.contains("jefe done"), "{t}");
 }
@@ -386,15 +386,13 @@ fn a_job_runs_on_an_ssh_host_and_attach_finds_it_again() {
         return;
     };
     let user = std::env::var("USER").unwrap();
-    let mut config = std::fs::read_to_string(env.root.join("jefe.toml")).unwrap();
-    config.push_str(&format!(
+    env.config(&format!(
         "\n[hosts.loop]\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{user}\"\nidentity = \"{}\"\n\
          fingerprints = [\"{}\"]\n",
         sshd.port,
         sshd.identity.display(),
         sshd.fingerprint
     ));
-    std::fs::write(env.root.join("jefe.toml"), config).unwrap();
     let repo = env.repo().to_string_lossy().into_owned();
     // A chief prompt override in the repository, read over SSH.
     std::fs::create_dir_all(env.repo().join(".jefe/prompts")).unwrap();
@@ -518,7 +516,7 @@ fn json_mode_speaks_protocol_v1() {
         caps["harnesses"].as_array().unwrap().contains(&"claude".into()),
         "{caps}"
     );
-    assert_eq!(caps["brains"], serde_json::json!(["rules", "harness"]));
+    assert_eq!(caps["brains"], serde_json::json!(["rules", "oneshot", "session"]));
 
     let bad = env.jefe(&["add hello", "--json", "--repo", "/nonexistent/repo"]);
     assert_eq!(bad.status.code(), Some(1));
@@ -638,4 +636,139 @@ fn status_live_follows_a_job_to_its_end() {
         !types.iter().any(|t| t == "job_created"),
         "replayed old events: {types:?}"
     );
+}
+
+/// A reviewer worker reads the diff and its verdict decides; the brain is
+/// never asked to review. Its session and worktree are gone afterwards.
+#[test]
+fn a_reviewer_worker_reviews_the_diff() {
+    let env = Env::new();
+    env.config_with("reviewer", false, "");
+    let out = env.jefe(&["add hello", "--json", "--unattended", "--id", "v1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lines = events(&out.stdout);
+    let types = event_types(&lines);
+    let count = |t: &str| types.iter().filter(|x| *x == t).count();
+    assert_eq!(count("worker_spawned"), 2, "{types:?}");
+    assert_eq!(count("artifact"), 1, "{types:?}");
+    let review = lines
+        .iter()
+        .filter(|l| l["event"]["type"] == "task_added")
+        .find(|l| l["event"]["kind"]["kind"] == "review")
+        .unwrap_or_else(|| panic!("no review task: {types:?}"));
+    assert_eq!(review["event"]["role"], "reviewer");
+    assert_eq!(review["event"]["kind"]["of"], "t1");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["event"]["type"] == "decided" && l["event"]["decision"]["source"]["by"] == "reviewer"),
+        "{types:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l["event"]["type"] == "consulted" && l["event"]["trigger"]["kind"] == "review"),
+        "the brain reviewed: {types:?}"
+    );
+    let prompts = std::fs::read_to_string(env.home().join("reviewer-prompts")).unwrap();
+    assert!(prompts.contains("Diff of t1"), "{prompts}");
+    assert!(prompts.contains("hello.txt"), "{prompts}");
+    assert!(env.repo().join("hello.txt").exists());
+    assert!(env.acc_dir_is_empty("w"), "worktree left behind");
+    assert!(env.acc_dir_is_empty("s"), "session left behind");
+}
+
+/// Attended over `--json`: the plan comes as an `ask` of kind `plan`, a
+/// `message` with `consult` is accepted, and `approve` starts the workers.
+#[test]
+fn the_plan_waits_for_approval_over_json() {
+    use std::io::Write as _;
+
+    let env = Env::new();
+    env.config_with("brain", true, "");
+    let mut child = env
+        .command(&["add hello", "--json", "--id", "ap1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+            all.push(v.clone());
+            let _ = tx.send(v);
+        }
+        all
+    });
+    let ask = loop {
+        let v = rx.recv_timeout(Duration::from_secs(60)).expect("no ask arrived");
+        if v["type"] == "ask" {
+            break v;
+        }
+    };
+    assert_eq!(ask["kind"], "plan", "{ask}");
+    assert_eq!(ask["options"], serde_json::json!(["approve"]));
+    assert!(
+        ask["question"].as_str().unwrap().contains("t1 [implementor]"),
+        "{ask}"
+    );
+    writeln!(stdin, r#"{{"cmd":"message","text":"keep it tiny"}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"cmd":"answer","ask":"{}","text":"approve"}}"#,
+        ask["ask"].as_str().unwrap()
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let status = child.wait().unwrap();
+    let lines = reader.join().unwrap();
+    assert_eq!(status.code(), Some(0), "{lines:?}");
+    let types = event_types(&lines);
+    let approved = types
+        .iter()
+        .position(|t| t == "plan_approved")
+        .unwrap_or_else(|| panic!("{types:?}"));
+    let spawned = types.iter().position(|t| t == "worker_spawned").unwrap();
+    assert!(approved < spawned, "{types:?}");
+    assert!(
+        lines.iter().any(|l| l["event"]["type"] == "notice"
+            && l["event"]["message"].as_str().unwrap().contains("keep it tiny")),
+        "{types:?}"
+    );
+}
+
+/// `--state host`: the job's snapshot, events and lease land on the host
+/// (here: this machine's state directory), and `attach` reads them back.
+#[test]
+fn host_side_state_is_saved_and_leased() {
+    let env = Env::new();
+    let out = env.jefe(&[
+        "add hello",
+        "--json",
+        "--unattended",
+        "--state",
+        "host",
+        "--id",
+        "hs1",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let dir = env.root.join("state/jobs/hs1");
+    let meta = std::fs::read_to_string(dir.join("meta")).unwrap();
+    assert!(meta.starts_with("done\t"), "{meta}");
+    assert!(meta.trim_end().ends_with("add hello"), "{meta}");
+    assert!(!dir.join("lease").exists(), "lease left behind");
+    let log = std::fs::read_to_string(dir.join("events.ndjson")).unwrap();
+    assert!(log.contains("job_created") && log.contains("job_done"), "{log}");
+    let types = event_types(&events(&out.stdout));
+    assert!(!types.iter().any(|t| t == "lease_lost"), "{types:?}");
+    assert_eq!(std::fs::read_to_string(dir.join("state")).unwrap(), "host");
+    // Attaching a finished host-state job reads the host's snapshot.
+    let again = env.jefe(&["attach", "hs1", "--json"]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(text(&again).contains("\"status\":\"done\""), "{}", text(&again));
 }

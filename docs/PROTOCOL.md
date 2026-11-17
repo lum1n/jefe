@@ -17,7 +17,7 @@ Every line has a `type`.
 |---|---|---|
 | `hello` | `version`, `job`, `jefe` (jefe's version), `acc` (acc's version) | first line of a run or attach |
 | `event` | `seq`, `at_ms`, `job`, `event` | each thing that happened; `seq` increases by one per job, across attaches |
-| `ask` | `ask`, `question`, `options` (may be empty) | jefe needs a human answer (attended jobs only) |
+| `ask` | `ask`, `question`, `options` (may be empty), `kind?` (`plan`: the plan waits for approval) | jefe needs a human answer (attended jobs only) |
 | `snapshot` | `job` | answer to `{"cmd":"status"}` |
 | `error` | `code`, `message` | see below |
 | `bye` | `status` (`done`, `failed` or `cancelled`) | last line of a job that ended |
@@ -39,10 +39,11 @@ Control is read when the job is attended, which is the default with `--json`. `-
 |---|---|
 | `{"cmd":"answer","ask":"a3","text":"yes"}` | answers the open `ask`. `ask` may be omitted or null. |
 | `{"cmd":"nudge","text":"…"}` | a note for the brain, shown in every later consultation |
+| `{"cmd":"message","text":"…","consult":true}` | a message to the orchestrator: the text is a note (may be empty), and with `consult` the orchestrator gets a turn of its own now (the `nudge` trigger) |
 | `{"cmd":"cancel"}` | stops the job and keeps every branch; ends with `job_cancelled` and `bye` |
 | `{"cmd":"status"}` | prints a `snapshot` |
 
-How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On an approval, `y`, `yes`, `ok` or `allow` grant it, and anything else denies it. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again.
+How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On an approval, `y`, `yes`, `ok` or `allow` grant it, and anything else denies it. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again. On the plan's approval (`ask.kind` is `plan`), `approve`, `y`, `yes`, `ok`, `go`, `lgtm` or `start` let the workers begin (`plan_approved`); anything else drops the planned tasks (`task_dropped`), becomes a note and the orchestrator plans again.
 
 ## Events
 
@@ -54,6 +55,8 @@ Each `event` object has a `type`. Below are its fields. `?` marks a field that m
 |---|---|
 | `job_created` | `goal`, `repo`, `base?`, `host` (`local` or a `[hosts.<name>]`) |
 | `planned` | `tasks`: task ids, in the plan's order |
+| `plan_approved` | the human approved the plan; workers start |
+| `lease_lost` | `holder`: another client took the job's host-side lease; this one stops driving (see [EMBED.md](EMBED.md)) |
 | `job_done` | `summary`, `merged`: `[{task, title, commit}]`, `branches`: branches left for a human |
 | `job_failed` | `reason`, `branches` |
 | `job_cancelled` | `branches` |
@@ -63,20 +66,23 @@ Each `event` object has a `type`. Below are its fields. `?` marks a field that m
 
 | `type` | fields |
 |---|---|
-| `task_added` | `task`, `title`, `kind`, `depends_on?` (task ids) |
+| `task_added` | `task`, `title`, `kind`, `depends_on?` (task ids), `role` |
 | `task_dropped` | `task`, `reason` |
 | `task_failed` | `task`, `reason` |
+| `artifact` | `task`, `role`, `chars`: a report task (a read-only or report role, or a review) finished; its report is in the snapshot's task (`report`) and goes into the briefs of the tasks that depend on it |
 | `reviewed` | `task`, `accepted`, `feedback?` |
 | `merged` | `task`, `commit` |
 | `merge_conflict` | `task`, `files` (each conflict becomes a `resolve_conflict` task) |
 
-`kind` is `{"kind":"implement"}` or `{"kind":"resolve_conflict","of":"t2","branch":"acc/…"}`.
+`kind` is `{"kind":"implement"}`, `{"kind":"resolve_conflict","of":"t2","branch":"acc/…"}` or `{"kind":"review","of":"t2"}` (a reviewer task the machine added for `t2`'s diff; see `[review] by`).
+
+`role` is the id of the role doing the task: `explorer`, `researcher`, `implementor`, `tester`, `reviewer` or one from `[roles.<id>]`. Read-only and report roles end with `status: done` and an `artifact` instead of a merge; worktree roles are reviewed and merged. Task statuses in the snapshot: `pending`, `assigned`, `working`, `reported`, `accepted`, `conflicted`, `merged`, `done` (a report task finished), `failed`, `dropped`. Job statuses: `planning`, `awaiting_approval`, `running`, `needs_human`, `done`, `failed`, `cancelled`.
 
 ### Workers
 
 | `type` | fields |
 |---|---|
-| `worker_spawned` | `worker`, `task`, `harness`, `branch` |
+| `worker_spawned` | `worker`, `task`, `harness`, `branch`, `role` |
 | `worker_prompted` | `worker`, `text` |
 | `worker_blocked` | `worker`, `kind` (`permission`, `question`, `auth`), `title` |
 | `worker_answered` | `worker`, `answers` (one list of answers per question) |
@@ -91,7 +97,9 @@ Each `event` object has a `type`. Below are its fields. `?` marks a field that m
 | `usage` | `worker`, `usage`: acc's `Usage` (`input_tokens?`, `output_tokens?`, `cache_read_tokens?`, `cache_write_tokens?`, `cost_usd?`, `context_used?`, `context_window?`) at each report |
 | `quota` | `worker`, `quota`: acc's `Quota` (`account?`, `plan?`, `windows`: `[{id, used_percent?, window_minutes?, resets_at?, status?}]`) |
 
-A worker's `result` is what it reported in its `jefe-result` block: `status` (`done`, `blocked`, `no_change` or `needs_input`), `summary`, `questions?` (`[{question, options}]`) and `notes?`.
+A worker's `result` is what it reported in its `jefe-result` block: `status` (`done`, `blocked`, `no_change` or `needs_input`), `summary`, `questions?` (`[{question, options}]`), `notes?` and, from a reviewer, `verdict?` (`accept` or `reject`; `summary` is then the feedback).
+
+Workers' acc sessions carry the labels `jefe_job`, `jefe_task` and `jefe_role`; the orchestrator's session carries `jefe_job` and `jefe_role=orchestrator`.
 
 Harness names: `claude`, `codex`, `cursor`, `copilot`, `opencode`, `pi` (see `jefe capabilities --json`).
 
@@ -102,7 +110,10 @@ Harness names: `claude`, `codex`, `cursor`, `copilot`, `opencode`, `pi` (see `je
 | `consulted` | `ask`, `trigger` |
 | `decided` | `ask`, `decision` |
 | `decision_rejected` | `ask`, `action`, `why`: the decision failed validation, and the brain is asked once more before the rules decide |
-| `human_asked` | `ask`, `question`, `options` |
+| `brain_started` | `session`, `harness`, `model?`: the orchestrator's harness session started (`[orchestrator] kind` other than `rules`). It is an acc session like a worker's; open it read-only to watch it think |
+| `brain_turn` | `session`, `ask?`, `text`: the orchestrator replied; `text` is its reply without the decision block |
+| `brain_ended` | `session`, `why`: the session was retired (one shot, turn limit), exited, timed out or the job ended |
+| `human_asked` | `ask`, `question`, `options`, `kind?` (`plan`) |
 | `human_answered` | `ask`, `text` |
 
 `trigger` is `{"kind": …}` plus the ids it is about:
@@ -120,8 +131,9 @@ Harness names: `claude`, `codex`, `cursor`, `copilot`, `opencode`, `pi` (see `je
 | `stalled` | `worker` | a worker went quiet |
 | `quota` | `worker` | a worker's subscription is nearly or fully used |
 | `wrap` | | every task is finished |
+| `nudge` | | the human sent a `message` with `consult` |
 
-A `decision` is one action with its `action` name flattened in, plus `rationale`, `confidence` (0–1) and `source`. `source` is `{"by":"brain","harness?","model?"}`, `{"by":"rules"}` or `{"by":"human"}`.
+A `decision` is one action with its `action` name flattened in, plus `rationale`, `confidence` (0–1) and `source`. `source` is `{"by":"brain","harness?","model?"}`, `{"by":"rules"}`, `{"by":"human"}` or `{"by":"reviewer","task"}` (a reviewer task's verdict, with `[review] by = "reviewer"`).
 
 ## Actions
 
@@ -129,7 +141,7 @@ These are the only things a brain can choose. For each consultation the loop wor
 
 | `action` | fields | does |
 |---|---|---|
-| `plan` | `tasks`: `[{title, brief, depends_on?, harness?}]` | sets the plan, or adds tasks at wrap-up. `depends_on` takes titles or ids. |
+| `plan` | `tasks`: `[{title, brief, role?, depends_on?, harness?, model?}]` | sets the plan, or adds tasks at wrap-up or on a nudge. `depends_on` takes titles or ids; `role` is `implementor` unless given, and must be an enabled role other than `reviewer`. |
 | `split` | `task`, `into` (tasks as for `plan`) | drops `task` and plans these instead |
 | `prompt` | `worker`, `text` | sends a worker a new turn |
 | `answer` | `worker`, `answers` | answers a worker's question |
@@ -138,7 +150,7 @@ These are the only things a brain can choose. For each consultation the loop wor
 | `interrupt` | `worker` | stops a worker's current turn |
 | `handoff` | `worker`, `harness`, `prompt?` | continues the task on another harness, primed with the conversation |
 | `respawn` | `worker` | starts the harness again, resuming its conversation |
-| `accept` | `task` | the diff is good: merge it |
+| `accept` | `task` | the diff is good: merge it (worktree roles only) |
 | `reject` | `task`, `feedback` | sends the task back to its worker |
 | `wait` | `ms` | does nothing for a while |
 | `ask_human` | `question`, `options` | asks the human (attended jobs only) |

@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use acc_ssh::Host;
 use acc_ssh::{Detached, Read};
-use jefe_core::{Brain, Effect, HumanReply, Input, Jefe, JobStatus, Report, RulesBrain, WorkerId};
+use jefe_core::brain::DecisionSource;
+use jefe_core::{Brain, Effect, Hosted, HumanReply, Input, Jefe, JobStatus, Report, RulesBrain, WorkerId};
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::brain::HarnessBrain;
 use crate::output::{Mode, Output};
 use crate::store::Store;
 
@@ -55,6 +55,19 @@ impl Control {
         });
     }
 
+    /// A message to the orchestrator; with `consult`, a turn of its own now.
+    pub fn message(&self, text: &str, consult: bool) {
+        self.human(HumanReply::Message {
+            text: text.to_owned(),
+            consult,
+        });
+    }
+
+    /// Gives the orchestrator a turn now (the `nudge` trigger).
+    pub fn consult_now(&self) {
+        self.message("", true);
+    }
+
     /// Stops the job, keeping every branch.
     pub fn cancel(&self) {
         self.human(HumanReply::Cancel);
@@ -77,46 +90,45 @@ enum Msg {
     Status,
 }
 
-/// Who answers the loop's consultations.
-#[derive(Debug, Clone)]
-pub enum BrainRunner {
-    Rules,
-    Harness(Arc<HarnessBrain>),
-}
-
-/// Drives one job to its end.
+/// Drives one job to its end. The loop runs the orchestrator itself when
+/// it is a harness; `Effect::Consult` only comes for the rules.
 #[derive(Debug)]
 pub struct Supervisor {
-    jefe: Jefe,
+    jefe: Hosted,
     host: Arc<Host>,
     store: Store,
     out: Output,
-    brain: BrainRunner,
     tx: mpsc::UnboundedSender<Msg>,
     rx: mpsc::UnboundedReceiver<Msg>,
     followers: HashMap<WorkerId, JoinHandle<()>>,
     wake_at: Option<u64>,
     report: Option<Report>,
+    /// Replies per ask, for `brain/<ask>.md`.
+    replies: HashMap<String, u32>,
     /// Ctrl-C and SIGTERM cancel the job (not when embedded).
     signals: bool,
 }
 
 impl Supervisor {
-    pub fn new(jefe: Jefe, host: Arc<Host>, store: Store, out: Output, brain: BrainRunner) -> Self {
+    pub fn new(jefe: Hosted, host: Arc<Host>, store: Store, out: Output) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             jefe,
             host,
             store,
             out,
-            brain,
             tx,
             rx,
             followers: HashMap::new(),
             wake_at: None,
             report: None,
+            replies: HashMap::new(),
             signals: true,
         }
+    }
+
+    fn core(&self) -> &Jefe {
+        self.jefe.jefe()
     }
 
     /// Leaves signals to the embedding program.
@@ -149,7 +161,7 @@ impl Supervisor {
         if self.signals {
             self.watch_signals();
         }
-        while self.report.is_none() {
+        while self.report.is_none() || !self.jefe.is_finished() {
             let now = now_ms();
             let due = [self.jefe.next_deadline(), self.wake_at]
                 .into_iter()
@@ -165,7 +177,7 @@ impl Supervisor {
                         self.step(input)?
                     }
                     Some(Msg::Status) => {
-                        let snap: serde_json::Value = serde_json::from_str(&self.jefe.snapshot())?;
+                        let snap: serde_json::Value = serde_json::from_str(&self.core().snapshot())?;
                         self.out.snapshot(&snap["job"]);
                     }
                     None => break,
@@ -192,7 +204,7 @@ impl Supervisor {
         let now = now_ms();
         self.store.input(&input, now)?;
         let effects = self.jefe.step(input, now);
-        self.store.save(&self.jefe.snapshot())?;
+        self.store.save(&self.core().snapshot())?;
         self.apply(effects)
     }
 
@@ -242,34 +254,40 @@ impl Supervisor {
                         f.abort();
                     }
                 }
-                Effect::Consult { ask, situation } => match &self.brain {
-                    BrainRunner::Rules => {
-                        let decision = RulesBrain.decide(&situation);
-                        self.send(Input::Decided { ask, decision });
-                    }
-                    BrainRunner::Harness(brain) => {
-                        let (brain, host, tx) = (brain.clone(), self.host.clone(), self.tx.clone());
-                        let log_dir = Some(self.store.dir().join("brain"));
-                        tokio::spawn(async move {
-                            let input = match brain.consult(host, &ask, &situation, log_dir).await {
-                                Ok(decision) => Input::Decided { ask, decision },
-                                Err(why) => Input::BrainFailed { ask, why },
-                            };
-                            let _ = tx.send(Msg::Input(input));
-                        });
-                    }
-                },
+                Effect::Consult { ask, situation } => {
+                    let decision = RulesBrain.decide(&situation);
+                    self.send(Input::Decided { ask, decision });
+                }
                 Effect::AskHuman {
                     ask,
                     question,
                     options,
-                } => self.out.ask(&ask, &question, &options),
+                    kind,
+                } => self.out.ask(&ask, &question, &options, kind.as_deref()),
                 Effect::Emit(s) => {
                     self.store.event(&s)?;
-                    if let jefe_core::Event::WorkerReported { worker, .. } = &s.event
-                        && let Some(text) = self.jefe.job().worker(worker).and_then(|w| w.last_message())
-                    {
-                        self.store.worker_final(worker.as_str(), &text)?;
+                    match &s.event {
+                        jefe_core::Event::WorkerReported { worker, .. } => {
+                            if let Some(text) =
+                                self.core().job().worker(worker).and_then(|w| w.last_message())
+                            {
+                                self.store.worker_final(worker.as_str(), &text)?;
+                            }
+                        }
+                        jefe_core::Event::BrainTurn {
+                            ask: Some(ask), text, ..
+                        } => {
+                            let n = self.replies.entry(ask.0.clone()).or_insert(0);
+                            *n += 1;
+                            self.store.brain_log(ask.as_str(), &format!("Reply {n}"), text)?;
+                        }
+                        jefe_core::Event::Decided { ask, decision }
+                            if matches!(decision.source, DecisionSource::Brain { .. }) =>
+                        {
+                            let json = serde_json::to_string(decision).unwrap_or_default();
+                            self.store.brain_log(ask.as_str(), "Decision", &json)?;
+                        }
+                        _ => {}
                     }
                     self.out.event(&s);
                 }

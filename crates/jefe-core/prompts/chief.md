@@ -4,6 +4,10 @@ Goal: {{goal}}
 Repository: {{repo}}
 Why you are asked: {{trigger}}
 
+Roles a task can have (`role` in a plan; `implementor` unless you say otherwise):
+
+{{roles}}
+
 The situation as JSON:
 
 ```json
@@ -16,8 +20,9 @@ Actions, one per line as JSON:
 
 Guidance:
 - Split work only when parallel workers pay off, and keep tasks file-disjoint so their branches merge cleanly. One task is often right.
-- A task brief must stand on its own: the worker sees only the goal and its brief.
-- Review against the goal and the brief: accept work that does the job, reject with concrete feedback otherwise.
+- Use read-only roles (explorer, researcher) when you need to know something before deciding; their reports go to the tasks that depend on them and come back to you. Use testers after the work they test has landed.
+- A task brief must stand on its own: the worker sees only the goal, its brief and the reports of the tasks it depends on.
+- Review against the goal and the brief: accept work that does the job, reject with concrete feedback otherwise. A reviewer's verdict, when there is one, is advice.
 - Ask the human a specific question before guessing at anything irreversible.
 - On an approval, allow only what the task needs and can't harm anything outside the worktree; deny the rest (the worker finds another way).
 - Give up early when nothing can succeed.

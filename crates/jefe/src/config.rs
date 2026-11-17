@@ -8,7 +8,8 @@ use acc_core::harness::Launcher;
 use acc_core::policy::Rule;
 use acc_core::sandbox::Sandbox;
 use anyhow::Context as _;
-use jefe_core::{Budget, Unmatched, WorkerConfig};
+use jefe_core::job::ReviewBy;
+use jefe_core::{BrainSpec, Budget, JobSpec, RoleConfig, Unmatched, WorkerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::hosts::{HostConfig, JobHost};
@@ -17,9 +18,14 @@ use crate::hosts::{HostConfig, JobHost};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub workers: Workers,
-    pub brain: BrainConfig,
+    /// `[brain]` still reads as `[orchestrator]`.
+    #[serde(alias = "brain")]
+    pub orchestrator: OrchestratorConfig,
+    /// `[roles.<id>]`: changes to the built-in roles, or new ones.
+    pub roles: BTreeMap<String, RoleConfig>,
     pub limits: Limits,
     pub review: Review,
+    pub plan: Plan,
     pub merge: Merge,
     /// SSH hosts for `--host <name>`.
     pub hosts: BTreeMap<String, HostConfig>,
@@ -30,6 +36,8 @@ pub struct Config {
 pub struct Workers {
     pub harness: Harness,
     pub model: Option<String>,
+    /// Reasoning effort, where the harness lists levels.
+    pub effort: Option<String>,
     /// Claude permission mode or Codex permission profile.
     pub permission: Option<String>,
     /// Workers running at once.
@@ -52,6 +60,7 @@ impl Default for Workers {
         Self {
             harness: w.harness,
             model: w.model,
+            effort: w.effort,
             permission: w.permission,
             max: Budget::default().max_workers,
             alternates: w.alternates,
@@ -63,42 +72,63 @@ impl Default for Workers {
     }
 }
 
+/// Who decides at judgment points.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum BrainKind {
     /// jefe's built-in rules.
     #[default]
     Rules,
-    /// A one-shot turn on a harness.
-    Harness,
+    /// A fresh harness session for each judgment point (`harness` before 0.2).
+    #[serde(alias = "harness")]
+    #[value(alias = "harness")]
+    Oneshot,
+    /// One harness session for the whole job, consulted turn by turn.
+    Session,
+}
+
+impl From<BrainKind> for jefe_core::BrainKind {
+    fn from(k: BrainKind) -> Self {
+        match k {
+            BrainKind::Rules => Self::Rules,
+            BrainKind::Oneshot => Self::Oneshot,
+            BrainKind::Session => Self::Session,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct BrainConfig {
+pub struct OrchestratorConfig {
     pub kind: BrainKind,
     /// Defaults to the workers' harness.
     pub harness: Option<Harness>,
     pub model: Option<String>,
-    /// Claude permission mode or Codex permission profile for the brain.
+    pub effort: Option<String>,
+    /// Claude permission mode or Codex permission profile for the orchestrator.
     pub permission: Option<String>,
-    /// Wrap or replace the brain's harness executable.
+    /// Wrap or replace the orchestrator's harness executable.
     pub launcher: Option<Launcher>,
     pub timeout_secs: u64,
-    /// Run the brain in acc's read-only sandbox.
+    /// Run the orchestrator in acc's read-only sandbox.
     pub sandbox: bool,
+    /// Turns per session before a fresh one is seeded (`session` kind).
+    pub max_turns: u32,
 }
 
-impl Default for BrainConfig {
+impl Default for OrchestratorConfig {
     fn default() -> Self {
+        let b = BrainSpec::default();
         Self {
             kind: BrainKind::Rules,
-            harness: None,
-            model: None,
-            permission: None,
-            launcher: None,
+            harness: b.harness,
+            model: b.model,
+            effort: b.effort,
+            permission: b.permission,
+            launcher: b.launcher,
             timeout_secs: Budget::default().brain_timeout_ms / 1000,
-            sandbox: true,
+            sandbox: b.sandbox,
+            max_turns: b.max_turns,
         }
     }
 }
@@ -113,6 +143,8 @@ pub struct Limits {
     pub stall_mins: u64,
     pub wall_mins: u64,
     pub quota_stop_pct: f64,
+    /// Fail the job once it has spent this much (harness cost figures).
+    pub max_cost_usd: Option<f64>,
 }
 
 impl Default for Limits {
@@ -126,6 +158,7 @@ impl Default for Limits {
             stall_mins: b.stall_ms / 60_000,
             wall_mins: b.wall_ms / 60_000,
             quota_stop_pct: b.quota_stop_pct,
+            max_cost_usd: b.max_cost_usd,
         }
     }
 }
@@ -134,16 +167,29 @@ impl Default for Limits {
 #[serde(default, deny_unknown_fields)]
 pub struct Review {
     pub required: bool,
+    /// Who reviews: `brain`, `reviewer` (a reviewer worker's verdict) or
+    /// `both` (the reviewer reads first, the brain decides).
+    pub by: ReviewBy,
     pub max_diff_chars: usize,
+    pub max_report_chars: usize,
 }
 
 impl Default for Review {
     fn default() -> Self {
         Self {
             required: true,
+            by: ReviewBy::default(),
             max_diff_chars: 60_000,
+            max_report_chars: 20_000,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Plan {
+    /// Wait for the human's approval of the plan. Unset: when attended.
+    pub approve: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +204,7 @@ pub const EXAMPLE: &str = r#"# ~/.config/jefe/jefe.toml. Every field is optional
 [workers]
 harness = "claude"
 # model = "sonnet"
+# effort = "medium"
 permission = "acceptEdits"
 max = 3
 alternates = ["codex"]
@@ -166,18 +213,36 @@ alternates = ["codex"]
 # Run workers in acc's sandbox:
 # sandbox = {}
 # launcher = { program = "/opt/claude/bin/claude" }
-# Approvals no policy rule matches: "deny", "brain" (the brain decides)
+# Approvals no policy rule matches: "deny", "brain" (the orchestrator decides)
 # or "human" (asked; denied when nobody is attending).
 unmatched = "deny"
 
-[brain]
-kind = "rules"          # or "harness"
+# The orchestrator (`[brain]` still works): "rules", "oneshot" (a fresh
+# harness session per judgment point) or "session" (one session for the
+# whole job, consulted turn by turn; it remembers the plan and your notes).
+[orchestrator]
+kind = "rules"
 # harness = "claude"
 # model = "opus"
+# effort = "high"
 # permission = "default"
 # launcher = { program = "/opt/claude/bin/claude" }
 timeout_secs = 300
 sandbox = true
+max_turns = 40
+
+# Roles: explorer, researcher, implementor, tester and reviewer are built in
+# and inherit [workers]. Change one, or add your own:
+# [roles.explorer]
+# harness = "pi"
+# model = "opencode-go/deepseek-v4.1-flash"
+# effort = "low"
+# [roles.tester]
+# enabled = false
+# [roles.docs]
+# description = "writes documentation for a change"
+# access = "worktree"            # or "read_only" / "report"
+# prompt = "Your role: documenter. ..."
 
 [limits]
 max_tasks = 8
@@ -187,10 +252,16 @@ max_consults = 60
 stall_mins = 10
 wall_mins = 180
 quota_stop_pct = 90.0
+# max_cost_usd = 10.0
 
 [review]
 required = true
+by = "both"             # "brain", "reviewer" or "both"
 max_diff_chars = 60000
+max_report_chars = 20000
+
+[plan]
+# approve = true          # wait for your OK before workers start (default: when attended)
 
 [merge]
 squash = false
@@ -205,6 +276,36 @@ squash = false
 # fingerprints = ["SHA256:..."]
 # connect_timeout_secs = 10
 "#;
+
+/// A team preset as `jefe.toml` sections, to paste into the config.
+pub fn preset_toml(p: &jefe_core::TeamPreset) -> String {
+    let mut config = Config::default();
+    let mut spec = JobSpec::new("x", "x", "x");
+    p.apply(&mut spec);
+    config.workers.harness = spec.workers.harness;
+    config.workers.model = spec.workers.model.clone();
+    config.workers.effort = spec.workers.effort.clone();
+    config.workers.max = spec.budget.max_workers;
+    config.workers.alternates = spec.workers.alternates.clone();
+    config.orchestrator.kind = match spec.brain.kind {
+        jefe_core::BrainKind::Rules => BrainKind::Rules,
+        jefe_core::BrainKind::Oneshot => BrainKind::Oneshot,
+        jefe_core::BrainKind::Session => BrainKind::Session,
+    };
+    config.orchestrator.harness = spec.brain.harness;
+    config.orchestrator.model = spec.brain.model.clone();
+    config.orchestrator.effort = spec.brain.effort.clone();
+    config.orchestrator.max_turns = spec.brain.max_turns;
+    config.roles = spec.roles.clone();
+    config.limits.max_tasks = spec.budget.max_tasks;
+    config.limits.wall_mins = spec.budget.wall_ms / 60_000;
+    config.limits.max_cost_usd = spec.budget.max_cost_usd;
+    config.review.by = spec.review_by;
+    config.plan.approve = spec.approve_plan;
+    let mut text = format!("# {}\n", p.name);
+    text.push_str(&toml::to_string(&config).unwrap_or_default());
+    text
+}
 
 impl Config {
     /// Reads `path`; a missing file is the defaults.
@@ -226,6 +327,11 @@ impl Config {
                 anyhow::bail!("[hosts.{name}]: use letters, digits, '-' or '_' in host names");
             }
             h.check().with_context(|| format!("[hosts.{name}]"))?;
+        }
+        for id in config.roles.keys() {
+            if !jefe_core::ids::valid_job_id(id) {
+                anyhow::bail!("[roles.{id}]: use letters, digits, '-' or '_' in role ids");
+            }
         }
         Ok(config)
     }
@@ -252,12 +358,27 @@ impl Config {
         WorkerConfig {
             harness: w.harness,
             model: w.model.clone(),
+            effort: w.effort.clone(),
             permission: w.permission.clone(),
             alternates: w.alternates.iter().copied().filter(|h| *h != w.harness).collect(),
             policy: w.policy.clone(),
             sandbox: w.sandbox.clone(),
             launcher: w.launcher.clone(),
             unmatched: w.unmatched,
+        }
+    }
+
+    pub fn brain_spec(&self) -> BrainSpec {
+        let o = &self.orchestrator;
+        BrainSpec {
+            kind: o.kind.into(),
+            harness: o.harness,
+            model: o.model.clone(),
+            effort: o.effort.clone(),
+            permission: o.permission.clone(),
+            launcher: o.launcher.clone(),
+            sandbox: o.sandbox,
+            max_turns: o.max_turns.max(1),
         }
     }
 
@@ -271,10 +392,38 @@ impl Config {
             max_consults: l.max_consults,
             stall_ms: l.stall_mins.saturating_mul(60_000),
             wall_ms: l.wall_mins.saturating_mul(60_000),
-            brain_timeout_ms: self.brain.timeout_secs.saturating_mul(1000),
+            brain_timeout_ms: self.orchestrator.timeout_secs.saturating_mul(1000),
             quota_stop_pct: l.quota_stop_pct,
             review_required: self.review.required,
+            max_cost_usd: l.max_cost_usd,
         }
+    }
+
+    /// A job spec with everything the config says; the caller sets the
+    /// goal, repository, host and attendance.
+    pub fn job_spec(&self, id: &str, goal: &str, repo: &str) -> JobSpec {
+        let mut spec = JobSpec::new(id, goal, repo);
+        spec.workers = self.worker_config();
+        spec.roles = self.roles.clone();
+        spec.brain = self.brain_spec();
+        spec.budget = self.budget();
+        spec.approve_plan = self.plan.approve;
+        spec.review_by = self.review.by;
+        spec.squash = self.merge.squash;
+        spec.max_diff_chars = self.review.max_diff_chars;
+        spec.max_report_chars = self.review.max_report_chars;
+        spec
+    }
+
+    /// Every role id a repository may override prompts for.
+    pub fn role_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = jefe_core::job::builtin_roles().into_keys().collect();
+        for id in self.roles.keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
     }
 }
 
@@ -319,5 +468,42 @@ mod tests {
     fn sandbox_table_turns_it_on() {
         let c = Config::parse("[workers]\nsandbox = {}\n").unwrap();
         assert_eq!(c.worker_config().sandbox, Some(Sandbox::default()));
+    }
+
+    #[test]
+    fn brain_section_and_harness_kind_still_read() {
+        let c = Config::parse("[brain]\nkind = \"harness\"\nmodel = \"opus\"\n").unwrap();
+        assert_eq!(c.orchestrator.kind, BrainKind::Oneshot);
+        let spec = c.job_spec("j", "g", "/r");
+        assert_eq!(spec.brain.kind, jefe_core::BrainKind::Oneshot);
+        assert_eq!(spec.brain.model.as_deref(), Some("opus"));
+        let c = Config::parse("[orchestrator]\nkind = \"session\"\nmax_turns = 3\n").unwrap();
+        assert_eq!(c.brain_spec().kind, jefe_core::BrainKind::Session);
+        assert_eq!(c.brain_spec().max_turns, 3);
+    }
+
+    #[test]
+    fn the_builtin_preset_prints_as_a_valid_config() {
+        let text = preset_toml(&jefe_core::TeamPreset::builtin());
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.orchestrator.kind, BrainKind::Session);
+        assert_eq!(c.workers.harness, Harness::Pi);
+        assert_eq!(c.roles["explorer"].effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn roles_review_and_plan_reach_the_spec() {
+        let c = Config::parse(
+            "[roles.explorer]\nharness = \"pi\"\neffort = \"low\"\n[roles.tester]\nenabled = false\n\
+             [review]\nby = \"reviewer\"\n[plan]\napprove = true\n[limits]\nmax_cost_usd = 2.5\n",
+        )
+        .unwrap();
+        let spec = c.job_spec("j", "g", "/r");
+        assert_eq!(spec.resolve("explorer").unwrap().harness, Harness::Pi);
+        assert!(spec.resolve("tester").is_none());
+        assert_eq!(spec.review_by, ReviewBy::Reviewer);
+        assert_eq!(spec.approve_plan, Some(true));
+        assert_eq!(spec.budget.max_cost_usd, Some(2.5));
+        assert!(Config::parse("[roles.bad id]\nenabled = false\n").is_err());
     }
 }

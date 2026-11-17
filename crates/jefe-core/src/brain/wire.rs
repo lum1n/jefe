@@ -12,9 +12,11 @@ const FENCE: &str = "```jefe-decision";
 pub fn schema_line(kind: ActionKind) -> &'static str {
     match kind {
         ActionKind::Plan => {
-            r#"{"action":"plan","tasks":[{"title":"..","brief":"what the worker must do, self-contained","depends_on":["t1"],"harness":"claude|codex|.."}]}"#
+            r#"{"action":"plan","tasks":[{"title":"..","brief":"what the worker must do, self-contained","role":"implementor|explorer|researcher|tester","depends_on":["t1"],"harness":"claude|codex|..","model":"optional"}]}"#
         }
-        ActionKind::Split => r#"{"action":"split","task":"t1","into":[{"title":"..","brief":".."}]}"#,
+        ActionKind::Split => {
+            r#"{"action":"split","task":"t1","into":[{"title":"..","brief":"..","role":"implementor"}]}"#
+        }
         ActionKind::Prompt => r#"{"action":"prompt","worker":"<worker id>","text":".."}"#,
         ActionKind::Answer => {
             r#"{"action":"answer","worker":"<worker id>","answers":[["answer to question 1"],["a","b"]]}"#
@@ -36,8 +38,41 @@ pub fn schema_line(kind: ActionKind) -> &'static str {
     }
 }
 
-/// The prompt for one consultation.
+/// The prompt for one consultation: the whole situation.
 pub fn render_prompt(s: &Situation, prompts: &Prompts) -> String {
+    let allowed: Vec<_> = s.allowed.iter().map(|k| k.name()).collect();
+    let actions: Vec<_> = s.allowed.iter().map(|k| schema_line(*k)).collect();
+    let roles: Vec<String> = s
+        .roles
+        .iter()
+        .map(|r| {
+            let model = r.model.as_deref().map(|m| format!(", {m}")).unwrap_or_default();
+            format!(
+                "- `{}`: {} ({}; {}{model})",
+                r.id,
+                r.description,
+                r.access.name().replace('_', "-"),
+                r.harness.id()
+            )
+        })
+        .collect();
+    let vars = BTreeMap::from([
+        ("goal", s.goal.clone()),
+        ("repo", s.repo.clone()),
+        ("trigger", s.trigger.name().replace('_', " ")),
+        ("allowed", allowed.join(", ")),
+        ("actions", actions.join("\n")),
+        ("roles", roles.join("\n")),
+        (
+            "situation",
+            serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".to_owned()),
+        ),
+    ]);
+    render(&prompts.chief, &vars)
+}
+
+/// A later turn of a persistent brain: only what changed, as `delta`.
+pub fn render_turn(s: &Situation, delta: &serde_json::Value, prompts: &Prompts) -> String {
     let allowed: Vec<_> = s.allowed.iter().map(|k| k.name()).collect();
     let actions: Vec<_> = s.allowed.iter().map(|k| schema_line(*k)).collect();
     let vars = BTreeMap::from([
@@ -47,11 +82,19 @@ pub fn render_prompt(s: &Situation, prompts: &Prompts) -> String {
         ("allowed", allowed.join(", ")),
         ("actions", actions.join("\n")),
         (
-            "situation",
-            serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".to_owned()),
+            "delta",
+            serde_json::to_string_pretty(delta).unwrap_or_else(|_| "{}".to_owned()),
         ),
     ]);
-    render(&prompts.chief, &vars)
+    render(&prompts.chief_turn, &vars)
+}
+
+/// `text` without its decision block, for the timeline.
+pub fn strip_decision(text: &str) -> String {
+    match text.rfind(FENCE) {
+        Some(i) => text[..i].trim_end().to_owned(),
+        None => text.trim_end().to_owned(),
+    }
 }
 
 /// The last decision block in `text` that parses as an action.
@@ -120,6 +163,7 @@ mod tests {
             }
             if let Some(tasks) = v.get_mut("tasks").and_then(|t| t.as_array_mut()) {
                 tasks[0]["harness"] = "codex".into();
+                tasks[0]["role"] = "explorer".into();
             }
             let a: Action = serde_json::from_value(v).unwrap();
             assert_eq!(a.kind(), *kind);

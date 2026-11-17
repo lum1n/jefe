@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use jefe::config::{BrainKind, Config};
-use jefe::{HarnessBrain, Mode, store};
-use jefe_core::{JobId, JobSpec};
+use jefe::{Mode, StateMode, store};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,12 +41,26 @@ struct RunArgs {
     /// The workers' harness (claude, codex, cursor, copilot, opencode, pi).
     #[arg(long)]
     harness: Option<String>,
-    /// Who decides at judgment points: built-in rules or a harness.
+    /// Who decides at judgment points: the rules, a fresh harness session
+    /// per judgment point (oneshot) or one session for the whole job.
     #[arg(long, value_enum)]
     brain: Option<BrainKind>,
-    /// The brain's harness (default: the workers').
+    /// The orchestrator's harness (default: the workers').
     #[arg(long)]
     brain_harness: Option<String>,
+    /// The orchestrator's model.
+    #[arg(long)]
+    brain_model: Option<String>,
+    /// Wait for your approval of the plan (default: when attended).
+    #[arg(long, conflicts_with = "no_approval")]
+    approve_plan: bool,
+    /// Start workers without showing you the plan first.
+    #[arg(long)]
+    no_approval: bool,
+    /// Keep the job's state on its host too, with a lease, so another
+    /// client (a desktop, a phone) can pick it up.
+    #[arg(long, value_enum, default_value_t = StateMode::Local)]
+    state: StateMode,
     /// Workers running at once.
     #[arg(long)]
     workers: Option<u32>,
@@ -73,7 +86,7 @@ struct RunArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start a job (the same as `jefe "<goal>"`).
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Show a job's state (default: the latest).
     Status {
         job: Option<String>,
@@ -93,6 +106,12 @@ enum Command {
         job: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Print the built-in team preset (the JSON the apps' settings share).
+    Preset {
+        /// The settings as jefe.toml sections instead of JSON.
+        #[arg(long)]
+        toml: bool,
     },
     /// Cancel a job, keeping its branches.
     Stop { job: String },
@@ -145,7 +164,7 @@ fn wants_json(cli: &Cli) -> bool {
             | Command::Attach { json, .. }
             | Command::Capabilities { json },
         ) => *json,
-        Some(Command::Stop { .. } | Command::Config { .. }) => false,
+        Some(Command::Stop { .. } | Command::Config { .. } | Command::Preset { .. }) => false,
     }
 }
 
@@ -166,10 +185,10 @@ fn mode(json: bool) -> Mode {
 fn run(cli: Cli) -> anyhow::Result<i32> {
     let command = match cli.command {
         Some(c) => c,
-        None => Command::Run(cli.run),
+        None => Command::Run(Box::new(cli.run)),
     };
     match command {
-        Command::Run(args) => run_job(args),
+        Command::Run(args) => run_job(*args),
         Command::Status { job, json, live } => status(job, json, live),
         Command::Jobs { json } => jobs(json),
         Command::Attach { job, json } => {
@@ -177,6 +196,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(jefe::output::exit_code(report.status))
         }
         Command::Stop { job } => stop(&job),
+        Command::Preset { toml } => {
+            let preset = jefe_core::TeamPreset::builtin();
+            if toml {
+                print!("{}", jefe::config::preset_toml(&preset));
+            } else {
+                println!("{}", preset.to_json());
+            }
+            Ok(0)
+        }
         Command::Capabilities { json } => {
             let caps = jefe::capabilities();
             if json {
@@ -210,12 +238,16 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
     }
     let config = Config::load(&a.config.unwrap_or_else(jefe::paths::config_file))?;
     let host = config.job_host(a.host.as_deref())?;
+    let roles = config.role_ids();
     let (repo_str, prompts) = if host.is_local() {
         let repo = a.repo.unwrap_or_else(|| PathBuf::from("."));
         let repo = repo
             .canonicalize()
             .with_context(|| format!("no repository at {}", repo.display()))?;
-        (repo.to_string_lossy().into_owned(), jefe::repo_prompts(&repo))
+        (
+            repo.to_string_lossy().into_owned(),
+            jefe::repo_prompts(&repo, &roles),
+        )
     } else {
         // The path is the host's: preflight checks it there.
         let repo = a
@@ -230,7 +262,7 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
             conn.connect()
                 .await
                 .with_context(|| format!("connecting to host {}", host.name))?;
-            jefe::host_prompts(&conn, &repo).await
+            jefe::host_prompts(&conn, &repo, &roles).await
         })??;
         (repo, prompts)
     };
@@ -241,49 +273,39 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
     if store::Store::dir_for(&id).join("job.json").exists() {
         anyhow::bail!("job {id} exists; `jefe attach {id}` resumes it");
     }
-    let mut workers = config.worker_config();
+    let mut spec = config.job_spec(&id, &goal, &repo_str);
+    spec.base = a.base;
+    spec.host = host.name.clone();
+    spec.prompts = prompts;
+    spec.allow_dirty = a.allow_dirty;
     if let Some(h) = a.harness {
-        workers.harness = harness(&h)?;
-        workers.alternates.retain(|x| *x != workers.harness);
+        spec.workers.harness = harness(&h)?;
+        let h = spec.workers.harness;
+        spec.workers.alternates.retain(|x| *x != h);
     }
-    let brain_harness = match a.brain_harness {
-        Some(h) => harness(&h)?,
-        None => config.brain.harness.unwrap_or(workers.harness),
-    };
-    let mut budget = config.budget();
+    if let Some(k) = a.brain {
+        spec.brain.kind = k.into();
+    }
+    if let Some(h) = a.brain_harness {
+        spec.brain.harness = Some(harness(&h)?);
+    }
+    if let Some(m) = a.brain_model {
+        spec.brain.model = Some(m);
+    }
     if let Some(n) = a.workers {
-        budget.max_workers = n.max(1);
+        spec.budget.max_workers = n.max(1);
     }
     if a.no_review {
-        budget.review_required = false;
+        spec.budget.review_required = false;
     }
-    let attended = !a.unattended && (a.json || std::io::stdin().is_terminal());
-    let spec = JobSpec {
-        id: JobId(id),
-        goal,
-        repo: repo_str,
-        base: a.base,
-        host: host.name.clone(),
-        workers,
-        budget,
-        attended,
-        allow_dirty: a.allow_dirty,
-        squash: config.merge.squash,
-        max_diff_chars: config.review.max_diff_chars,
-        prompts,
-    };
-    let brain = (a.brain.unwrap_or(config.brain.kind) == BrainKind::Harness).then(|| HarnessBrain {
-        job: spec.id.clone(),
-        repo: spec.repo.clone(),
-        harness: brain_harness,
-        model: config.brain.model.clone(),
-        permission: config.brain.permission.clone(),
-        launcher: config.brain.launcher.clone(),
-        sandbox: config.brain.sandbox,
-        timeout_ms: spec.budget.brain_timeout_ms,
-        prompts: spec.prompts.clone(),
-    });
-    let report = block_on(jefe::start(spec, host, brain, mode(a.json), attended))??;
+    if a.approve_plan {
+        spec.approve_plan = Some(true);
+    } else if a.no_approval {
+        spec.approve_plan = Some(false);
+    }
+    spec.attended = !a.unattended && (a.json || std::io::stdin().is_terminal());
+    let attended = spec.attended;
+    let report = block_on(jefe::start(spec, host, a.state, mode(a.json), attended))??;
     Ok(jefe::output::exit_code(report.status))
 }
 

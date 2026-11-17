@@ -25,9 +25,21 @@ pub struct ResultQuestion {
     pub options: Vec<String>,
 }
 
+/// A reviewer's judgment of the diff it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Accept,
+    Reject,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerResult {
     pub status: ResultStatus,
+    /// A reviewer's verdict on the diff in its brief; its `summary` is the
+    /// feedback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
     #[serde(default)]
     pub summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

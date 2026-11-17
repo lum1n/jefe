@@ -4,8 +4,8 @@
 
 use super::{Action, ActionKind, Brain, Decision, Focus, Situation, Trigger, WorkerView};
 use crate::ids::{TaskId, WorkerId};
-use crate::job::{TaskSpec, TaskStatus};
-use crate::result::ResultStatus;
+use crate::job::TaskSpec;
+use crate::result::{ResultStatus, Verdict};
 
 /// What a worker is told when nobody can answer its questions.
 pub const DECIDE_YOURSELF: &str =
@@ -65,19 +65,26 @@ fn candidates(s: &Situation) -> (Vec<Action>, &'static str) {
     match &s.trigger {
         Trigger::Plan => (
             vec![Action::Plan {
-                tasks: vec![TaskSpec {
-                    title: title_of(&s.goal),
-                    brief: s.goal.clone(),
-                    depends_on: Vec::new(),
-                    harness: None,
-                }],
+                tasks: vec![TaskSpec::new(&title_of(&s.goal), &s.goal)],
             }],
             "one task: the whole goal",
         ),
-        Trigger::Review { task, .. } => (
-            vec![Action::Accept { task: task.clone() }],
-            "accept what reports done",
-        ),
+        Trigger::Review { task, .. } => match &s.focus {
+            Some(Focus::Review { review: Some(r), .. }) if r.verdict == Some(Verdict::Reject) => (
+                vec![
+                    Action::Reject {
+                        task: task.clone(),
+                        feedback: r.summary.clone(),
+                    },
+                    Action::Accept { task: task.clone() },
+                ],
+                "the reviewer rejected it",
+            ),
+            _ => (
+                vec![Action::Accept { task: task.clone() }],
+                "accept what reports done",
+            ),
+        },
         Trigger::Question { worker, .. } => {
             let answers = match &s.focus {
                 Some(Focus::Question { questions, .. }) => questions
@@ -190,12 +197,9 @@ fn candidates(s: &Situation) -> (Vec<Action>, &'static str) {
             out.push(Action::Wait { ms: 15 * 60_000 });
             (out, "hand off to a harness with quota left, else wait")
         }
+        Trigger::Nudge => (vec![Action::Wait { ms: 60_000 }], "nothing to do"),
         Trigger::Wrap => {
-            let merged: Vec<_> = s
-                .tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Merged)
-                .collect();
+            let merged: Vec<_> = s.tasks.iter().filter(|t| t.status.landed()).collect();
             if merged.is_empty() {
                 (
                     vec![Action::GiveUp {
