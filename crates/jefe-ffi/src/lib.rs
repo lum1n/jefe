@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use acc_core::session::SessionSpec;
+use jefe_core::brain::{Brain as _, RulesBrain};
 use jefe_core::io::Effect;
 use jefe_core::{Hosted, Input, JobSpec, TeamPreset};
 
@@ -65,6 +66,28 @@ impl From<acc_core::Exec> for JefeExec {
         Self {
             script: e.script,
             stdin: e.stdin,
+        }
+    }
+}
+
+/// Answers the loop's `Consult` effects with the rules (the brain when
+/// `kind = rules`, the fallback otherwise), so an app never sees them.
+fn settle_consults(hosted: &mut Hosted, mut effects: Vec<Effect>, now_ms: u64) -> Vec<Effect> {
+    let mut out = Vec::new();
+    loop {
+        let mut pending = Vec::new();
+        for e in effects {
+            match e {
+                Effect::Consult { ask, situation } => pending.push((ask, RulesBrain.decide(&situation))),
+                other => out.push(other),
+            }
+        }
+        if pending.is_empty() {
+            return out;
+        }
+        effects = Vec::new();
+        for (ask, decision) in pending {
+            effects.extend(hosted.step(Input::Decided { ask, decision }, now_ms));
         }
     }
 }
@@ -137,7 +160,8 @@ impl JefeJob {
                 reason: format!("bad job id {:?}: up to 40 letters, digits, '-' or '_'", spec.id),
             });
         }
-        let (hosted, effects) = Hosted::start(spec, &client, now_ms);
+        let (mut hosted, effects) = Hosted::start(spec, &client, now_ms);
+        let effects = settle_consults(&mut hosted, effects, now_ms);
         Ok(Arc::new(Self {
             inner: Mutex::new(hosted),
             pending: Mutex::new(encode(effects)),
@@ -159,10 +183,11 @@ impl JefeJob {
             .iter()
             .filter_map(|j| SessionSpec::from_json(j))
             .collect();
-        let (hosted, effects) =
+        let (mut hosted, effects) =
             Hosted::open(&snapshot, &specs, &client, now_ms).map_err(|e| JefeError::Restore {
                 reason: e.to_string(),
             })?;
+        let effects = settle_consults(&mut hosted, effects, now_ms);
         Ok(Arc::new(Self {
             inner: Mutex::new(hosted),
             pending: Mutex::new(encode(effects)),
@@ -181,7 +206,8 @@ impl JefeJob {
     pub fn step(&self, input_json: String, now_ms: u64) -> Result<Vec<JefeEffect>, JefeError> {
         let input: Input = serde_json::from_str(&input_json).map_err(bad_json)?;
         let mut h = self.lock()?;
-        Ok(encode(h.step(input, now_ms)))
+        let effects = h.step(input, now_ms);
+        Ok(encode(settle_consults(&mut h, effects, now_ms)))
     }
 
     /// Gives the lease up on purpose (the app goes to the background):
@@ -499,6 +525,35 @@ mod tests {
                 .unwrap()
                 .contains("\"goal\":\"add hello\"")
         );
+    }
+
+    #[test]
+    fn rules_consultations_are_answered_inside() {
+        let spec = new_job_spec_json(
+            "j2".into(),
+            "add hello".into(),
+            "/repo".into(),
+            "local".into(),
+            false,
+        );
+        let job = JefeJob::start(spec, "phone".into(), 1_000).unwrap();
+        let effects = job.take_effects();
+        let preflight: serde_json::Value = effects
+            .iter()
+            .map(|e| serde_json::from_str::<serde_json::Value>(&e.json).unwrap())
+            .find(|v| v["purpose"]["purpose"] == "preflight")
+            .unwrap();
+        let input = serde_json::json!({
+            "input": "exec_done", "id": preflight["id"], "code": 0, "stdout": "/repo\nmain\n", "stderr": ""
+        });
+        let out = job.step(input.to_string(), 1_100).unwrap();
+        // The rules planned at once: no consult for the app, a worktree to make.
+        assert!(
+            !out.iter().any(|e| e.json.contains("\"effect\":\"consult\"")),
+            "{out:?}"
+        );
+        assert!(out.iter().any(|e| e.json.contains("worktree_add")), "{out:?}");
+        assert_eq!(job.status().unwrap(), "running");
     }
 
     #[test]
