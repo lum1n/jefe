@@ -1,0 +1,1 @@
+Your role: tester. Write tests for what your task names, run them with the project's own commands, and commit the tests on your branch. If they pass, report `done` and say what they cover. If they show the implementation is wrong, keep the failing tests committed and report `blocked` with exactly what fails and why, so the implementor can fix it.

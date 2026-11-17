@@ -9,26 +9,35 @@ use acc_core::session::{LaunchRequest, Outbound, SessionSpec, Update};
 use acc_core::{BlockKind, Exec};
 use serde::{Deserialize, Serialize};
 
+use crate::brain::session::{ASK_FOR_BLOCK, BrainObs, BrainPhase, BrainSession};
 use crate::brain::{
-    Action, Brain, Decision, DecisionSource, DecisionView, Focus, Limits, QuestionView, RulesBrain,
-    Situation, TaskView, Trigger, WorkerView,
+    Action, Brain, Decision, DecisionSource, DecisionView, Focus, Limits, QuestionView, ReviewView, RoleView,
+    RulesBrain, Situation, TaskView, Trigger, WorkerView, wire,
 };
 use crate::event::{Event, Stamped};
-use crate::ids::{AskId, ExecId, TaskId, WorkerId, worker_id};
+use crate::ids::{AskId, ExecId, TaskId, WorkerId, brain_id, worker_id};
 use crate::io::{Effect, HumanReply, Input, Purpose};
 use crate::job::{
-    Counters, Job, JobSpec, JobStatus, MergedTask, Report, Task, TaskKind, TaskSpec, TaskStatus, Unmatched,
+    Access, BrainKind, Counters, Job, JobSpec, JobStatus, MergedTask, REVIEWER_ROLE, Report, ResolvedWorker,
+    ReviewBy, Task, TaskKind, TaskSpec, TaskStatus, Unmatched,
 };
 use crate::merge;
 use crate::prompts::render;
 use crate::result::{ResultStatus, WorkerResult, parse_result, strip_result};
 use crate::rules::{self, Context};
-use crate::worker::{Obs, Worker, WorkerPhase};
+use crate::worker::{Deferred, Obs, Worker, WorkerPhase};
 
 /// Decisions kept in a situation's history.
 const HISTORY: usize = 12;
 /// Characters of a worker's last message shown to the brain.
 const TAIL_CHARS: usize = 2_000;
+/// Characters of a report shown to the brain in a task view.
+const EXCERPT_CHARS: usize = 1_500;
+/// Characters of the brain's reply kept in a `brain_turn` event.
+const BRAIN_TEXT_CHARS: usize = 4_000;
+/// Launches of the orchestrator's harness that may fail in a row before the
+/// rules take over for good.
+const BRAIN_LAUNCH_FAILURES: u32 = 3;
 
 const ASK_FOR_RESULT: &str = "End your final message with the ```jefe-result block described in your instructions \
      (status done, no_change, needs_input or blocked, and a summary).";
@@ -36,6 +45,7 @@ const WRAP_UP: &str = "You were interrupted because you stopped making progress.
      report with a ```jefe-result block.";
 const CONTINUE: &str = "Your session was restarted. Continue the task where you left off, and end with a \
      ```jefe-result block.";
+const PLAN_KIND: &str = "plan";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PendingAsk {
@@ -51,6 +61,17 @@ struct HumanAsk {
     /// Questions the worker asked, when the human answers for it.
     #[serde(default)]
     questions: usize,
+    /// `plan` when the plan waits for approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+}
+
+/// What the brain was last told, so a later turn can say what changed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct BrainSeen {
+    tasks: BTreeMap<TaskId, (TaskStatus, u32, Option<WorkerId>)>,
+    workers: BTreeMap<WorkerId, String>,
+    notes: usize,
 }
 
 /// The loop's own bookkeeping, saved with the job.
@@ -73,6 +94,28 @@ struct Book {
     history: Vec<DecisionView>,
     wrap_asked: bool,
     consults_exhausted: bool,
+    /// The orchestrator's session, when it is a harness.
+    #[serde(default)]
+    brain: Option<BrainSession>,
+    #[serde(default)]
+    next_brain: u32,
+    /// Asks waiting for the brain to finish its current turn.
+    #[serde(default)]
+    brain_queue: Vec<AskId>,
+    #[serde(default)]
+    brain_seen: BrainSeen,
+    /// Launches of the brain's harness that failed in a row.
+    #[serde(default)]
+    brain_launch_failures: u32,
+    /// The rules decide for the rest of the job: the brain's harness won't start.
+    #[serde(default)]
+    brain_disabled: bool,
+    /// What retired brain sessions spent.
+    #[serde(default)]
+    brain_cost_retired: f64,
+    /// Retired brain sessions whose files go once their kill is done.
+    #[serde(default)]
+    brain_removals: BTreeMap<String, Exec>,
     /// The job is over; waiting for cleanup execs before `Finished`.
     finishing: bool,
     finished: bool,
@@ -83,7 +126,7 @@ struct SnapshotDoc {
     v: u32,
     spec: JobSpec,
     job: serde_json::Value,
-    book: Book,
+    book: serde_json::Value,
 }
 
 const SNAPSHOT_VERSION: u32 = 1;
@@ -125,6 +168,7 @@ impl Jefe {
             counters: Counters::default(),
             created_ms: now_ms,
             notes: Vec::new(),
+            brain_cost_usd: 0.0,
             report: None,
         };
         let mut j = Self {
@@ -158,20 +202,48 @@ impl Jefe {
         self.book.finished
     }
 
-    /// When the loop next needs a [`Input::Tick`]: the earliest stall or
-    /// wall-clock deadline.
+    /// The orchestrator's current harness session, if it runs as one.
+    pub fn brain_session(&self) -> Option<&BrainSession> {
+        self.book.brain.as_ref()
+    }
+
+    /// Whether `id` names the orchestrator's session (now or earlier).
+    pub fn is_brain_session(&self, id: &str) -> bool {
+        id.starts_with(&format!("jefe-{}-b", self.job.id))
+    }
+
+    /// When the loop next needs a [`Input::Tick`]: the earliest stall,
+    /// held-back prompt, brain timeout or wall-clock deadline.
     pub fn next_deadline(&self) -> Option<u64> {
         if self.job.status.is_terminal() {
             return None;
         }
         let b = &self.spec.budget;
         let wall = self.job.created_ms.saturating_add(b.wall_ms);
+        let brain = self.book.brain.iter().flat_map(|br| {
+            let timeout = match &br.phase {
+                BrainPhase::Thinking { since_ms, .. } if br.deferred.is_none() => {
+                    Some(since_ms.saturating_add(b.brain_timeout_ms))
+                }
+                _ => None,
+            };
+            timeout
+                .into_iter()
+                .chain(br.deferred.as_ref().map(Deferred::deadline))
+        });
         self.job
             .workers
             .iter()
             .filter(|w| matches!(w.phase, WorkerPhase::Working | WorkerPhase::Waiting))
             .map(|w| w.last_progress_ms.saturating_add(b.stall_ms))
             .chain(self.job.workers.iter().filter_map(|w| w.resend_at))
+            .chain(
+                self.job
+                    .workers
+                    .iter()
+                    .filter_map(|w| w.deferred.as_ref().map(Deferred::deadline)),
+            )
+            .chain(brain)
             .chain([wall])
             .min()
     }
@@ -191,38 +263,49 @@ impl Jefe {
                 stderr,
             } => self.on_exec(id, code, &stdout, &stderr),
             Input::Bytes { worker, bytes } => {
-                let updates = match self.job.worker_mut(&worker) {
-                    Some(w) => w.feed(&bytes, now_ms),
-                    None => Vec::new(),
-                };
-                self.on_updates(&worker, &updates);
+                if self.is_brain_session(worker.as_str()) {
+                    self.on_brain_bytes(worker.as_str(), &bytes);
+                } else {
+                    let updates = match self.job.worker_mut(&worker) {
+                        Some(w) => w.feed(&bytes, now_ms),
+                        None => Vec::new(),
+                    };
+                    self.on_updates(&worker, &updates);
+                }
             }
             Input::LogEnded { worker, code } => {
-                let updates = match self.job.worker_mut(&worker) {
-                    Some(w) => w.on_exit(code, now_ms),
-                    None => Vec::new(),
-                };
-                self.on_updates(&worker, &updates);
-                if let Some(w) = self.job.worker(&worker)
-                    && !matches!(
-                        w.phase,
-                        WorkerPhase::Exited { .. } | WorkerPhase::Gone | WorkerPhase::Discarding
-                    )
-                    && w.replaced_by.is_none()
-                {
-                    self.on_exited(&worker, code);
+                if self.is_brain_session(worker.as_str()) {
+                    self.on_brain_log_ended(worker.as_str(), code);
+                } else {
+                    let updates = match self.job.worker_mut(&worker) {
+                        Some(w) => w.on_exit(code, now_ms),
+                        None => Vec::new(),
+                    };
+                    self.on_updates(&worker, &updates);
+                    if let Some(w) = self.job.worker(&worker)
+                        && !matches!(
+                            w.phase,
+                            WorkerPhase::Exited { .. } | WorkerPhase::Gone | WorkerPhase::Discarding
+                        )
+                        && w.replaced_by.is_none()
+                    {
+                        self.on_exited(&worker, code);
+                    }
                 }
             }
             Input::Decided { ask, decision } => self.on_decided(ask, decision),
-            Input::BrainFailed { ask, why } => {
-                if self.book.asks.contains_key(&ask) {
-                    self.notice(format!("the brain failed ({why}); the rules decide"));
-                    self.decide_by_rules(ask);
-                }
-            }
+            Input::BrainFailed { ask, why } => self.brain_failed(&ask, &why),
             Input::Human(reply) => self.on_human(reply),
         }
         self.settle();
+        std::mem::take(&mut self.out)
+    }
+
+    /// Records an event from outside the loop (the host's state store, say)
+    /// with the job's own numbering.
+    pub fn record(&mut self, event: Event, now_ms: u64) -> Vec<Effect> {
+        self.now = now_ms;
+        self.emit(event);
         std::mem::take(&mut self.out)
     }
 
@@ -238,11 +321,17 @@ impl Jefe {
                 }
             }
         }
+        let mut book = serde_json::to_value(&self.book).unwrap_or_default();
+        if let Some(snap) = self.book.brain.as_ref().and_then(BrainSession::snapshot)
+            && let Some(b) = book.get_mut("brain")
+        {
+            b["session_snapshot"] = snap.into();
+        }
         let doc = serde_json::json!({
             "v": SNAPSHOT_VERSION,
             "spec": &self.spec,
             "job": job,
-            "book": &self.book,
+            "book": book,
         });
         doc.to_string()
     }
@@ -261,11 +350,12 @@ impl Jefe {
             return Err(RestoreError::Version(doc.v));
         }
         let job: Job = serde_json::from_value(doc.job)?;
-        let lost: Vec<(ExecId, Purpose)> = doc.book.runs.clone().into_iter().collect();
+        let book: Book = serde_json::from_value(doc.book)?;
+        let lost: Vec<(ExecId, Purpose)> = book.runs.clone().into_iter().collect();
         let mut j = Self {
             spec: doc.spec,
             job,
-            book: doc.book,
+            book,
             now: now_ms,
             out: Vec::new(),
         };
@@ -274,7 +364,6 @@ impl Jefe {
         if j.book.finished {
             return Ok((j, Vec::new()));
         }
-        let rules = crate::policy::worker_rules(&j.spec.workers.policy);
         let mut gone = Vec::new();
         for w in &mut j.job.workers {
             if w.discarded || (matches!(w.phase, WorkerPhase::Gone) && w.cwd.is_none()) {
@@ -282,7 +371,7 @@ impl Jefe {
             }
             match specs.iter().find(|s| s.id == w.id.as_str()) {
                 Some(spec) => {
-                    if w.reattach(spec.clone(), rules.clone()).is_err() {
+                    if w.reattach(spec.clone(), w.config.policy.clone()).is_err() {
                         gone.push(w.id.clone());
                     }
                 }
@@ -290,6 +379,22 @@ impl Jefe {
                 None => gone.push(w.id.clone()),
             }
         }
+        // The brain: back to its session when it still runs, else a fresh
+        // one answers the asks it was thinking about.
+        let mut brain_waits_on: Option<AskId> = None;
+        if let Some(brain) = &mut j.book.brain
+            && brain.is_live()
+        {
+            match specs.iter().find(|s| s.id == brain.id) {
+                Some(spec) if brain.reattach(spec.clone()).is_ok() => {
+                    brain_waits_on = brain.thinking_about().cloned();
+                }
+                _ => {
+                    brain.phase = BrainPhase::Gone;
+                }
+            }
+        }
+        j.book.brain_queue.clear();
         // Re-run what was in flight where running it twice is harmless.
         for (id, p) in lost {
             match p {
@@ -316,7 +421,18 @@ impl Jefe {
                         worker.resend_at = Some(resend_at);
                     }
                 }
-                Purpose::Launch(_) | Purpose::Status(_) | Purpose::SpecWrite(_) => {}
+                Purpose::BrainKill(id) => j.brain_remove(&id),
+                Purpose::BrainRemove(_) => {}
+                Purpose::Launch(_)
+                | Purpose::Status(_)
+                | Purpose::SpecWrite(_)
+                | Purpose::BrainLaunch(_)
+                | Purpose::BrainInput(_)
+                | Purpose::BrainStatus(_)
+                | Purpose::BrainSpecWrite(_)
+                | Purpose::Save
+                | Purpose::Lease
+                | Purpose::Release => {}
             }
         }
         // A replacement waiting for its predecessor's kill: launch it now
@@ -353,6 +469,14 @@ impl Jefe {
                 j.run(exec, Purpose::Status(id));
             }
         }
+        if let Some(brain) = &j.book.brain
+            && brain.is_live()
+            && brain.has_session()
+            && let Some(exec) = brain.status_exec()
+        {
+            let id = brain.id.clone();
+            j.run(exec, Purpose::BrainStatus(id));
+        }
         for id in gone {
             if let Some(w) = j.job.worker_mut(&id)
                 && w.is_live()
@@ -362,13 +486,19 @@ impl Jefe {
         }
         let asks: Vec<(AskId, PendingAsk)> = std::mem::take(&mut j.book.asks).into_iter().collect();
         for (ask, pending) in asks {
-            j.issue_consult(ask, pending);
+            if brain_waits_on.as_ref() == Some(&ask) {
+                // Its turn still runs; the reply comes with the log.
+                j.book.asks.insert(ask, pending);
+            } else {
+                j.issue_consult(ask, pending);
+            }
         }
         if let Some(h) = j.book.human.clone() {
             j.out.push(Effect::AskHuman {
                 ask: h.ask,
                 question: "(asked before the restart; see the log)".to_owned(),
                 options: Vec::new(),
+                kind: h.kind,
             });
         }
         j.notice("resumed".to_owned());
@@ -380,11 +510,7 @@ impl Jefe {
     // ---- plumbing ------------------------------------------------------------
 
     fn cx(&self) -> Context<'_> {
-        Context {
-            budget: &self.spec.budget,
-            attended: self.spec.attended,
-            alternates: &self.spec.workers.alternates,
-        }
+        Context { spec: &self.spec }
     }
 
     fn emit(&mut self, event: Event) {
@@ -428,6 +554,7 @@ impl Jefe {
             self.next_merge();
             self.maybe_wrap();
         }
+        self.check_cost();
         if self.book.finishing && self.book.runs.is_empty() && !self.book.finished {
             self.book.finished = true;
             let report = self
@@ -439,6 +566,18 @@ impl Jefe {
                 status: self.job.status,
                 report,
             });
+        }
+    }
+
+    /// Ends the job once it has spent more than its cap.
+    fn check_cost(&mut self) {
+        if let Some(cap) = self.spec.budget.max_cost_usd
+            && !self.job.status.is_terminal()
+        {
+            let spent = self.job.cost_usd();
+            if spent > cap {
+                self.fail_job(format!("the job spent ${spent:.2}, over its ${cap:.2} cap"));
+            }
         }
     }
 
@@ -543,6 +682,31 @@ impl Jefe {
                     self.run_pending_launch(&next);
                 }
             }
+            Purpose::BrainLaunch(id) => self.on_brain_launched(&id, code, stdout, &err()),
+            Purpose::BrainStatus(id) => {
+                let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+                    return;
+                };
+                let updates = brain.on_status(stdout, self.now);
+                let offset = brain.offset();
+                self.out.push(Effect::Follow {
+                    worker: WorkerId(id.clone()),
+                    host: self.job.host.clone(),
+                    offset,
+                });
+                self.on_brain_updates(&id, &updates);
+            }
+            Purpose::BrainInput(id) => {
+                if code != 0 {
+                    self.notice(format!("writing to the orchestrator ({id}) failed: {}", err()));
+                }
+            }
+            Purpose::BrainKill(id) => self.brain_remove(&id),
+            Purpose::BrainSpecWrite(_)
+            | Purpose::BrainRemove(_)
+            | Purpose::Save
+            | Purpose::Lease
+            | Purpose::Release => {}
         }
     }
 
@@ -602,17 +766,15 @@ impl Jefe {
             .map(|t| t.id.clone())
             .collect();
         for id in pending {
-            let deps: Vec<TaskStatus> = self
-                .job
-                .task(&id)
-                .map(|t| {
-                    t.depends_on
-                        .iter()
-                        .filter_map(|d| self.job.task(d))
-                        .map(|d| d.status)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let Some(t) = self.job.task(&id) else { continue };
+            let deps: Vec<TaskStatus> = t
+                .depends_on
+                .iter()
+                .filter_map(|d| self.job.task(d))
+                .map(|d| d.status)
+                .collect();
+            let review = matches!(t.kind, TaskKind::Review { .. });
+            let role = t.role.clone();
             if deps
                 .iter()
                 .any(|s| matches!(s, TaskStatus::Failed | TaskStatus::Dropped))
@@ -620,13 +782,25 @@ impl Jefe {
                 self.drop_task(&id, "a task it depends on did not land".to_owned());
                 continue;
             }
-            if !deps.iter().all(|s| *s == TaskStatus::Merged) {
+            if !deps.iter().all(|s| s.landed()) {
                 continue;
             }
-            if self.job.live_workers() >= self.spec.budget.max_workers as usize {
+            // A review is short and read-only: it may run beside a full
+            // house, else a lone reported worker would block its own review.
+            if !review && self.job.live_workers() >= self.spec.budget.max_workers as usize {
                 break;
             }
-            self.spawn(&id);
+            let Some(cfg) = self.spec.resolve(&role) else {
+                self.fail_task(&id, format!("its role {role:?} is not available"));
+                continue;
+            };
+            if cfg
+                .max
+                .is_some_and(|m| self.job.live_workers_of(&role) >= m as usize)
+            {
+                continue;
+            }
+            self.spawn(&id, cfg);
         }
     }
 
@@ -635,17 +809,23 @@ impl Jefe {
         worker_id(&self.job.id, self.book.next_worker)
     }
 
-    fn spawn(&mut self, task: &TaskId) {
+    fn spawn(&mut self, task: &TaskId, mut cfg: ResolvedWorker) {
         let id = self.new_worker_id();
         let Some(t) = self.job.task_mut(task) else { return };
-        let harness = t.harness.unwrap_or(self.spec.workers.harness);
+        if let Some(h) = t.harness {
+            cfg.harness = h;
+            cfg.alternates.retain(|a| *a != h);
+        }
+        if let Some(m) = &t.model {
+            cfg.model = Some(m.clone());
+        }
         t.status = TaskStatus::Assigned;
         t.worker = Some(id.clone());
         t.attempts += 1;
         let worker = Worker::new(
             id.clone(),
             task.clone(),
-            harness,
+            cfg,
             self.job.host.clone(),
             id.0.clone(),
             self.now,
@@ -662,7 +842,50 @@ impl Jefe {
         self.run(Exec::new(script), Purpose::WorktreeAdd(w.clone()));
     }
 
-    fn worker_prompt(&self, task: &Task, branch: &str, feedback: Option<&str>) -> String {
+    /// The reports and diffs a task's brief is completed with: what the
+    /// tasks it depends on handed back, and the diff it reviews.
+    fn task_inputs(&self, task: &Task) -> String {
+        let mut inputs = String::new();
+        if let TaskKind::Review { of } = &task.kind
+            && let Some(t) = self.job.task(of)
+        {
+            inputs.push_str(&format!(
+                "## The task under review: {} ({})\n\n{}\n\n",
+                t.id, t.title, t.brief
+            ));
+            if let Some(r) = &t.result {
+                inputs.push_str(&format!("The worker's summary: {}\n\n", r.summary));
+            }
+            inputs.push_str(&format!(
+                "## Diff of {}\n\n```diff\n{}\n```\n\n",
+                t.id,
+                t.diff.as_deref().unwrap_or("(empty)")
+            ));
+        }
+        for dep in &task.depends_on {
+            if let Some(t) = self.job.task(dep)
+                && let Some(report) = &t.report
+            {
+                inputs.push_str(&format!(
+                    "## Report from {} ({}): {}\n\n{}\n\n",
+                    t.id, t.role, t.title, report
+                ));
+            }
+        }
+        if inputs.is_empty() {
+            inputs
+        } else {
+            format!("What you were given:\n\n{inputs}")
+        }
+    }
+
+    fn worker_prompt(
+        &self,
+        task: &Task,
+        cfg: &ResolvedWorker,
+        branch: &str,
+        feedback: Option<&str>,
+    ) -> String {
         let feedback = feedback
             .map(|f| format!("\nFeedback on your previous attempt:\n\n{f}\n"))
             .unwrap_or_default();
@@ -670,6 +893,9 @@ impl Jefe {
             ("goal", self.job.goal.clone()),
             ("task_title", task.title.clone()),
             ("task_brief", task.brief.clone()),
+            ("role", cfg.role.clone()),
+            ("role_prompt", cfg.prompt.trim().to_owned()),
+            ("inputs", self.task_inputs(task)),
             ("branch", branch.to_owned()),
             ("feedback", feedback),
         ]);
@@ -681,17 +907,23 @@ impl Jefe {
         let Some(task) = worker.task.as_ref().and_then(|t| self.job.task(t)) else {
             return;
         };
-        let cfg = &self.spec.workers;
+        let cfg = worker.config.clone();
+        let prompt = self.worker_prompt(task, &cfg, &worker.branch, None);
+        let deferred = cfg
+            .effort
+            .clone()
+            .map(|effort| Deferred::new(prompt.clone(), effort, self.now));
         let req = LaunchRequest {
             harness: Some(worker.harness),
             cwd: cwd.clone(),
             model: cfg.model.clone(),
             permission: cfg.permission.clone(),
             title: Some(task.title.clone()),
-            prompt: Some(self.worker_prompt(task, &worker.branch, None)),
+            prompt: deferred.is_none().then_some(prompt),
             labels: BTreeMap::from([
                 ("jefe_job".to_owned(), self.job.id.0.clone()),
                 ("jefe_task".to_owned(), task.id.0.clone()),
+                ("jefe_role".to_owned(), cfg.role.clone()),
             ]),
             launcher: cfg.launcher.clone(),
             worktree: Some(worker.worktree.clone()),
@@ -699,13 +931,13 @@ impl Jefe {
             ..LaunchRequest::default()
         };
         let task_id = task.id.clone();
-        let rules = crate::policy::worker_rules(&cfg.policy);
         let now = self.now;
         let Some(worker) = self.job.worker_mut(w) else {
             return;
         };
         worker.cwd = Some(cwd);
-        match worker.launch(req, rules, now) {
+        worker.deferred = deferred;
+        match worker.launch(req, cfg.policy.clone(), now) {
             Ok(exec) => {
                 worker.phase = WorkerPhase::Launching;
                 let (harness, branch) = (worker.harness, worker.branch.clone());
@@ -717,6 +949,7 @@ impl Jefe {
                     task: task_id,
                     harness,
                     branch,
+                    role: cfg.role,
                 });
                 self.run(exec, Purpose::Launch(w.clone()));
             }
@@ -766,6 +999,31 @@ impl Jefe {
         }
     }
 
+    /// Sends a worker's held-back first prompt once its harness has listed
+    /// its effort levels (or the wait is over).
+    fn send_deferred(&mut self, w: &WorkerId) {
+        let now = self.now;
+        let Some(worker) = self.job.worker_mut(w) else {
+            return;
+        };
+        let Some(cmds) = worker.deferred_due(now) else {
+            return;
+        };
+        worker.deferred = None;
+        let mut execs = Vec::new();
+        for cmd in cmds {
+            if let Ok(Outbound::Send(bytes)) = worker.command(cmd)
+                && let Some(exec) = worker.input_exec(bytes)
+            {
+                execs.push(exec);
+            }
+        }
+        worker.last_progress_ms = now;
+        for exec in execs {
+            self.run(exec, Purpose::Input(w.clone()));
+        }
+    }
+
     fn on_updates(&mut self, w: &WorkerId, updates: &[Update]) {
         let Some(worker) = self.job.worker_mut(w) else {
             return;
@@ -785,6 +1043,7 @@ impl Jefe {
             self.reconcile(w);
         }
         self.on_requests(w);
+        self.send_deferred(w);
         self.flush(w);
     }
 
@@ -829,7 +1088,12 @@ impl Jefe {
                 worker.phase = WorkerPhase::Waiting;
                 worker.last_progress_ms = now;
             }
-            Obs::TurnDone => self.on_turn_done(w),
+            Obs::TurnDone => {
+                // A turn before the first prompt (a harness greeting) is nothing.
+                if worker.deferred.is_none() {
+                    self.on_turn_done(w);
+                }
+            }
             Obs::TurnError(message) => {
                 worker.phase = WorkerPhase::Errored {
                     message: message.clone(),
@@ -942,7 +1206,7 @@ impl Jefe {
             worker.handled.push(p.request_id.clone());
             match p.kind {
                 BlockKind::Permission => {
-                    let who = match self.spec.workers.unmatched {
+                    let who = match worker.config.unmatched {
                         Unmatched::Human if !self.spec.attended => Unmatched::Deny,
                         u => u,
                     };
@@ -975,6 +1239,7 @@ impl Jefe {
                             format!("{w} asks to: {}. Allow it?", p.title),
                             vec!["allow".to_owned(), "deny".to_owned()],
                             1,
+                            None,
                         );
                     } else {
                         let detail = serde_json::to_string(&p.native).unwrap_or_default();
@@ -1042,6 +1307,7 @@ impl Jefe {
             return;
         };
         let message = worker.last_message().unwrap_or_default();
+        let reports = worker.config.access.reports();
         let result = match parse_result(&message) {
             Some(r) => r,
             None if worker.result_nudges == 0 && worker.turns < max_turns => {
@@ -1051,6 +1317,7 @@ impl Jefe {
             }
             None => WorkerResult {
                 status: ResultStatus::Done,
+                verdict: None,
                 summary: tail(&strip_result(&message), 500),
                 questions: Vec::new(),
                 notes: "no result block; taken as done".to_owned(),
@@ -1062,6 +1329,7 @@ impl Jefe {
         if task.status != TaskStatus::Working {
             return;
         }
+        let reports = reports || matches!(task.kind, TaskKind::Review { .. });
         task.status = TaskStatus::Reported;
         task.result = Some(result.clone());
         let Some(worker) = self.job.worker_mut(w) else {
@@ -1079,7 +1347,9 @@ impl Jefe {
             usage,
         });
         match result.status {
+            ResultStatus::Done if reports => self.report_done(&task_id, &message, &result),
             ResultStatus::Done => self.run_diff(&task_id),
+            ResultStatus::NoChange if reports => self.report_done(&task_id, &message, &result),
             ResultStatus::NoChange => {
                 self.drop_task(&task_id, format!("no change needed: {}", result.summary));
             }
@@ -1094,6 +1364,129 @@ impl Jefe {
                 }),
             ),
         }
+    }
+
+    /// A report task finished: keep its report, hand it on, let its worker go.
+    fn report_done(&mut self, task: &TaskId, message: &str, result: &WorkerResult) {
+        let max = self.spec.max_report_chars;
+        let mut text = strip_result(message);
+        // The message is the report; the block's summary closes it.
+        if text.trim().is_empty() {
+            text = result.summary.clone();
+        } else if !result.summary.trim().is_empty() && !text.contains(result.summary.trim()) {
+            text.push_str("\n\n");
+            text.push_str(result.summary.trim());
+        }
+        let report = cut(&text, max);
+        let Some(t) = self.job.task_mut(task) else { return };
+        t.status = TaskStatus::Done;
+        t.report = Some(report.clone());
+        let (role, kind) = (t.role.clone(), t.kind.clone());
+        self.emit(Event::Artifact {
+            task: task.clone(),
+            role,
+            chars: report.chars().count(),
+        });
+        self.discard_task_workers(task);
+        if let TaskKind::Review { of } = kind {
+            self.on_review_done(&of, task, result);
+        }
+    }
+
+    /// A reviewer reported on `of`'s diff: its verdict decides, or informs
+    /// the brain, as `review_by` says.
+    fn on_review_done(&mut self, of: &TaskId, review_task: &TaskId, result: &WorkerResult) {
+        let Some(t) = self.job.task(of) else { return };
+        if t.status != TaskStatus::Reported {
+            return;
+        }
+        let (Some(worker), Some(own_result), Some(diff)) =
+            (t.worker.clone(), t.result.clone(), t.diff.clone())
+        else {
+            return;
+        };
+        let review = ReviewView {
+            task: review_task.clone(),
+            verdict: result.verdict,
+            summary: result.summary.clone(),
+        };
+        let trigger = Trigger::Review {
+            task: of.clone(),
+            worker,
+        };
+        if self.spec.review_by == ReviewBy::Reviewer
+            && let Some(verdict) = result.verdict
+        {
+            let action = match verdict {
+                crate::result::Verdict::Accept => Action::Accept { task: of.clone() },
+                crate::result::Verdict::Reject => Action::Reject {
+                    task: of.clone(),
+                    feedback: result.summary.clone(),
+                },
+            };
+            let decision = Decision {
+                action,
+                rationale: result.summary.clone(),
+                confidence: 1.0,
+                source: DecisionSource::Reviewer {
+                    task: review_task.clone(),
+                },
+            };
+            let ask = self.next_ask();
+            self.book.asks.insert(
+                ask.clone(),
+                PendingAsk {
+                    trigger,
+                    focus: Some(Focus::Review {
+                        task: of.clone(),
+                        result: own_result,
+                        diff,
+                        review: Some(review),
+                    }),
+                    rejections: 0,
+                },
+            );
+            self.on_decided(ask, decision);
+            return;
+        }
+        self.consult(
+            trigger,
+            Some(Focus::Review {
+                task: of.clone(),
+                result: own_result,
+                diff,
+                review: Some(review),
+            }),
+        );
+    }
+
+    /// A review task ended without a verdict (its worker failed, it was
+    /// dropped): the brain reviews the task itself.
+    fn review_task_lost(&mut self, task: &TaskId) {
+        let Some(of) = self.job.task(task).and_then(|t| t.reviews().cloned()) else {
+            return;
+        };
+        let Some(t) = self.job.task(&of) else { return };
+        if t.status != TaskStatus::Reported {
+            return;
+        }
+        let (Some(worker), Some(result), Some(diff)) = (t.worker.clone(), t.result.clone(), t.diff.clone())
+        else {
+            return;
+        };
+        self.notice(format!("{task} gave no review of {of}; the brain reviews it"));
+        self.consult(
+            Trigger::Review {
+                task: of.clone(),
+                worker,
+            },
+            Some(Focus::Review {
+                task: of,
+                result,
+                diff,
+                review: None,
+            }),
+        );
     }
 
     /// Sends a worker a new turn.
@@ -1152,10 +1545,12 @@ impl Jefe {
         // The predecessor is stopped here; acc's replace flag is for clients
         // that relaunch in place.
         req.replaces_parent = false;
+        let mut cfg = old.config.clone();
+        cfg.harness = req.harness.unwrap_or(old.harness);
         let mut next = Worker::new(
             new_id.clone(),
             task.clone(),
-            req.harness.unwrap_or(old.harness),
+            cfg,
             old.host.clone(),
             old.worktree.clone(),
             self.now,
@@ -1198,7 +1593,6 @@ impl Jefe {
     }
 
     fn run_pending_launch(&mut self, w: &WorkerId) {
-        let rules = crate::policy::worker_rules(&self.spec.workers.policy);
         let now = self.now;
         let Some(worker) = self.job.worker_mut(w) else {
             return;
@@ -1206,6 +1600,7 @@ impl Jefe {
         let Some(req) = worker.pending_launch.take() else {
             return;
         };
+        let rules = worker.config.policy.clone();
         let exec = match worker.launch(req, rules, now) {
             Ok(exec) => exec,
             Err(e) => {
@@ -1214,13 +1609,19 @@ impl Jefe {
             }
         };
         let Some(worker) = self.job.worker(w) else { return };
-        let (task, harness, branch) = (worker.task.clone(), worker.harness, worker.branch.clone());
+        let (task, harness, branch, role) = (
+            worker.task.clone(),
+            worker.harness,
+            worker.branch.clone(),
+            worker.config.role.clone(),
+        );
         if let Some(task) = task {
             self.emit(Event::WorkerSpawned {
                 worker: w.clone(),
                 task,
                 harness,
                 branch,
+                role,
             });
         }
         self.job.counters.spawns += 1;
@@ -1331,7 +1732,9 @@ impl Jefe {
                 s.brief.clone(),
                 TaskKind::Implement,
                 deps,
+                s.role.clone(),
                 s.harness,
+                s.model.clone(),
             );
             ids.push(id);
         }
@@ -1339,6 +1742,7 @@ impl Jefe {
         ids
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_task(
         &mut self,
         id: TaskId,
@@ -1346,13 +1750,16 @@ impl Jefe {
         brief: String,
         kind: TaskKind,
         depends_on: Vec<TaskId>,
+        role: String,
         harness: Option<acc_core::Harness>,
+        model: Option<String>,
     ) {
         self.emit(Event::TaskAdded {
             task: id.clone(),
             title: title.clone(),
             kind: kind.clone(),
             depends_on: depends_on.clone(),
+            role: role.clone(),
         });
         self.job.tasks.push(Task {
             id,
@@ -1364,13 +1771,16 @@ impl Jefe {
             },
             kind,
             depends_on,
+            role,
             harness,
+            model,
             status: TaskStatus::Pending,
             attempts: 0,
             conflicts: 0,
             worker: None,
             result: None,
             diff: None,
+            report: None,
             commit: None,
             failure: None,
         });
@@ -1384,6 +1794,7 @@ impl Jefe {
             reason,
         });
         self.discard_task_workers(task);
+        self.review_task_lost(task);
     }
 
     fn fail_task(&mut self, task: &TaskId, reason: String) {
@@ -1400,6 +1811,7 @@ impl Jefe {
         });
         // The branch stays for a human to look at.
         self.stop_task_workers(task);
+        self.review_task_lost(task);
     }
 
     fn run_diff(&mut self, task: &TaskId) {
@@ -1420,18 +1832,13 @@ impl Jefe {
             self.fail_task(task, format!("reading its diff failed: {err}"));
             return;
         }
-        let max = self.spec.max_diff_chars;
-        let diff = if stdout.len() > max {
-            let cut = (0..=max).rev().find(|i| stdout.is_char_boundary(*i)).unwrap_or(0);
-            format!("{}\n[diff cut at {max} characters]", &stdout[..cut])
-        } else {
-            stdout.to_owned()
-        };
+        let diff = cut(stdout, self.spec.max_diff_chars);
         let Some(t) = self.job.task_mut(task) else { return };
         if t.status != TaskStatus::Reported {
             return;
         }
         t.diff = Some(diff.clone());
+        let title = t.title.clone();
         let (Some(worker), Some(result)) = (t.worker.clone(), t.result.clone()) else {
             return;
         };
@@ -1439,14 +1846,7 @@ impl Jefe {
             task: task.clone(),
             worker,
         };
-        if self.spec.budget.review_required {
-            let focus = Focus::Review {
-                task: task.clone(),
-                result,
-                diff,
-            };
-            self.consult(trigger, Some(focus));
-        } else {
+        if !self.spec.budget.review_required {
             let ask = self.next_ask();
             let d = Decision::rules(Action::Accept { task: task.clone() }, "review is off");
             self.book.asks.insert(
@@ -1458,7 +1858,45 @@ impl Jefe {
                 },
             );
             self.on_decided(ask, d);
+            return;
         }
+        if self.spec.review_by != ReviewBy::Brain && self.add_review_task(task, &title) {
+            return;
+        }
+        self.consult(
+            trigger,
+            Some(Focus::Review {
+                task: task.clone(),
+                result,
+                diff,
+                review: None,
+            }),
+        );
+    }
+
+    /// Adds a reviewer task for `task`'s diff, when the role is on and the
+    /// job has room for one more task.
+    fn add_review_task(&mut self, task: &TaskId, title: &str) -> bool {
+        if self.spec.resolve(REVIEWER_ROLE).is_none()
+            || self.job.tasks.len() >= self.spec.budget.max_tasks as usize
+        {
+            return false;
+        }
+        self.book.next_task += 1;
+        let id = TaskId(format!("t{}", self.book.next_task));
+        self.push_task(
+            id,
+            format!("Review: {title}"),
+            format!(
+                "Review the diff of {task} (\"{title}\") against the goal and its brief, and give a verdict."
+            ),
+            TaskKind::Review { of: task.clone() },
+            Vec::new(),
+            REVIEWER_ROLE.to_owned(),
+            None,
+            None,
+        );
+        true
     }
 
     fn next_merge(&mut self) {
@@ -1518,7 +1956,7 @@ impl Jefe {
         t.commit = Some(commit.clone());
         let of = match &t.kind {
             TaskKind::ResolveConflict { of, .. } => Some(of.clone()),
-            TaskKind::Implement => None,
+            TaskKind::Implement | TaskKind::Review { .. } => None,
         };
         self.job.counters.merges += 1;
         self.emit(Event::Merged {
@@ -1537,7 +1975,7 @@ impl Jefe {
             t.commit = Some(commit.clone());
             of = match &t.kind {
                 TaskKind::ResolveConflict { of, .. } => Some(of.clone()),
-                TaskKind::Implement => None,
+                TaskKind::Implement | TaskKind::Review { .. } => None,
             };
             self.discard_task_workers(&orig);
         }
@@ -1580,7 +2018,7 @@ impl Jefe {
         };
         let title = format!("Resolve merge conflict: {}", t.title);
         let brief = merge::conflict_brief(&t.title, &branch, &files);
-        let harness = t.harness;
+        let (harness, model, role) = (t.harness, t.model.clone(), t.role.clone());
         // Its harness can go; the branch stays until the conflict task merges it.
         self.stop_task_workers(task);
         self.book.next_task += 1;
@@ -1589,7 +2027,7 @@ impl Jefe {
             of: task.clone(),
             branch,
         };
-        self.push_task(id, title, brief, kind, Vec::new(), harness);
+        self.push_task(id, title, brief, kind, Vec::new(), role, harness, model);
         self.book.wrap_asked = false;
     }
 
@@ -1624,21 +2062,78 @@ impl Jefe {
     }
 
     fn issue_consult(&mut self, ask: AskId, pending: PendingAsk) {
-        let situation = self.situation(&ask, &pending);
         self.emit(Event::Consulted {
             ask: ask.clone(),
             trigger: pending.trigger.clone(),
         });
         self.book.asks.insert(ask.clone(), pending);
-        self.out.push(Effect::Consult {
-            ask,
-            situation: Box::new(situation),
-        });
+        if self.spec.brain.kind == BrainKind::Rules || self.book.brain_disabled {
+            let Some(pending) = self.book.asks.get(&ask) else {
+                return;
+            };
+            let situation = self.situation(&ask, pending);
+            self.out.push(Effect::Consult {
+                ask,
+                situation: Box::new(situation),
+            });
+        } else {
+            self.brain_ask(ask);
+        }
     }
 
     /// What the brain sees for `pending`.
     pub fn situation_for(&self, ask: &AskId) -> Option<Situation> {
         self.book.asks.get(ask).map(|p| self.situation(ask, p))
+    }
+
+    fn task_view(&self, t: &Task) -> TaskView {
+        TaskView {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            brief: t.brief.clone(),
+            kind: t.kind.clone(),
+            role: t.role.clone(),
+            status: t.status,
+            attempts: t.attempts,
+            depends_on: t.depends_on.clone(),
+            worker: t.worker.clone(),
+            summary: t.result.as_ref().map(|r| r.summary.clone()),
+            report_excerpt: t.report.as_ref().map(|r| cut(r, EXCERPT_CHARS)),
+        }
+    }
+
+    fn worker_view(&self, w: &Worker) -> WorkerView {
+        WorkerView {
+            id: w.id.clone(),
+            task: w.task.clone(),
+            role: w.config.role.clone(),
+            harness: w.harness,
+            phase: w.phase.name().to_owned(),
+            turns: w.turns,
+            respawns: w.respawns,
+            stalls: w.stalls,
+            plan: w.plan.clone(),
+            cost_usd: w.usage.cost_usd,
+            tail: tail(&w.last_message().unwrap_or_default(), TAIL_CHARS),
+        }
+    }
+
+    fn role_views(&self) -> Vec<RoleView> {
+        self.spec
+            .enabled_roles()
+            .into_iter()
+            .filter(|(id, _)| id != REVIEWER_ROLE)
+            .filter_map(|(id, r)| {
+                let resolved = self.spec.resolve(&id)?;
+                Some(RoleView {
+                    id,
+                    description: r.description,
+                    access: r.access,
+                    harness: resolved.harness,
+                    model: resolved.model,
+                })
+            })
+            .collect()
     }
 
     fn situation(&self, ask: &AskId, pending: &PendingAsk) -> Situation {
@@ -1652,45 +2147,20 @@ impl Jefe {
             attended: self.spec.attended,
             harness: self.spec.workers.harness,
             alternates: self.spec.workers.alternates.clone(),
+            roles: self.role_views(),
             limits: Limits {
                 max_workers: b.max_workers,
                 max_tasks: b.max_tasks,
                 max_attempts: b.max_attempts,
                 max_turns_per_worker: b.max_turns_per_worker,
             },
-            tasks: self
-                .job
-                .tasks
-                .iter()
-                .map(|t| TaskView {
-                    id: t.id.clone(),
-                    title: t.title.clone(),
-                    brief: t.brief.clone(),
-                    kind: t.kind.clone(),
-                    status: t.status,
-                    attempts: t.attempts,
-                    depends_on: t.depends_on.clone(),
-                    worker: t.worker.clone(),
-                    summary: t.result.as_ref().map(|r| r.summary.clone()),
-                })
-                .collect(),
+            tasks: self.job.tasks.iter().map(|t| self.task_view(t)).collect(),
             workers: self
                 .job
                 .workers
                 .iter()
                 .filter(|w| w.is_live() || pending.trigger.worker() == Some(&w.id))
-                .map(|w| WorkerView {
-                    id: w.id.clone(),
-                    task: w.task.clone(),
-                    harness: w.harness,
-                    phase: w.phase.name().to_owned(),
-                    turns: w.turns,
-                    respawns: w.respawns,
-                    stalls: w.stalls,
-                    plan: w.plan.clone(),
-                    cost_usd: w.usage.cost_usd,
-                    tail: tail(&w.last_message().unwrap_or_default(), TAIL_CHARS),
-                })
+                .map(|w| self.worker_view(w))
                 .collect(),
             focus: pending.focus.clone(),
             allowed: rules::allowed(&self.job, &pending.trigger, self.cx()),
@@ -1758,13 +2228,35 @@ impl Jefe {
         self.on_decided(ask, decision);
     }
 
+    /// The brain couldn't answer `ask`; the rules do.
+    fn brain_failed(&mut self, ask: &AskId, why: &str) {
+        if self.book.asks.contains_key(ask) {
+            self.notice(format!("the brain failed ({why}); the rules decide"));
+            self.decide_by_rules(ask.clone());
+        }
+    }
+
     fn apply(&mut self, pending: &PendingAsk, action: Action) {
         let trigger = &pending.trigger;
         match action {
             Action::Plan { tasks } => {
                 let ids = self.add_tasks(&tasks, &[]);
-                self.job.status = JobStatus::Running;
                 self.emit(Event::Planned { tasks: ids });
+                if self.job.status == JobStatus::Planning {
+                    if self.spec.plan_needs_approval() {
+                        self.job.status = JobStatus::AwaitingApproval;
+                        let question = self.plan_question();
+                        self.ask_human(
+                            Trigger::Plan,
+                            question,
+                            vec!["approve".to_owned()],
+                            1,
+                            Some(PLAN_KIND),
+                        );
+                    } else {
+                        self.job.status = JobStatus::Running;
+                    }
+                }
             }
             Action::Split { task, into } => {
                 let deps = self
@@ -1843,8 +2335,9 @@ impl Jefe {
                 });
                 let Some(t) = self.job.task(&task) else { return };
                 let Some(w) = t.worker.clone() else { return };
-                let branch = self.job.worker(&w).map(|x| x.branch.clone()).unwrap_or_default();
-                let text = self.worker_prompt(t, &branch, Some(&feedback));
+                let Some(worker) = self.job.worker(&w) else { return };
+                let (branch, cfg) = (worker.branch.clone(), worker.config.clone());
+                let text = self.worker_prompt(t, &cfg, &branch, Some(&feedback));
                 self.prompt_worker(&w, text, true);
             }
             Action::Wait { ms } => {
@@ -1861,7 +2354,7 @@ impl Jefe {
                     Some(Focus::Question { questions, .. }) => questions.len(),
                     _ => 1,
                 };
-                self.ask_human(trigger.clone(), question, options, questions);
+                self.ask_human(trigger.clone(), question, options, questions, None);
             }
             Action::GiveUpTask { task, reason } => self.fail_task(&task, reason),
             Action::GiveUp { reason } => self.fail_job(reason),
@@ -1869,25 +2362,498 @@ impl Jefe {
         }
     }
 
+    /// The plan, for the human to approve.
+    fn plan_question(&self) -> String {
+        let mut q = String::from("The plan:\n");
+        for t in self.job.tasks.iter().filter(|t| t.status == TaskStatus::Pending) {
+            let deps = if t.depends_on.is_empty() {
+                String::new()
+            } else {
+                let d: Vec<&str> = t.depends_on.iter().map(TaskId::as_str).collect();
+                format!(" (after {})", d.join(", "))
+            };
+            q.push_str(&format!("- {} [{}] {}{deps}\n", t.id, t.role, t.title));
+        }
+        q.push_str("Reply `approve` to start, or say what to change.");
+        q
+    }
+
+    // ---- the orchestrator's session -----------------------------------------------
+
+    /// Puts `ask` to the brain's session: a turn now, a fresh session when
+    /// none runs, or a place in the queue while it thinks.
+    fn brain_ask(&mut self, ask: AskId) {
+        let Some(pending) = self.book.asks.get(&ask).cloned() else {
+            return;
+        };
+        let situation = self.situation(&ask, &pending);
+        match self.book.brain.as_ref().map(|b| (b.phase.clone(), b.turns)) {
+            Some((BrainPhase::Thinking { .. } | BrainPhase::Launching, _)) => {
+                if !self.book.brain_queue.contains(&ask) {
+                    self.book.brain_queue.push(ask);
+                }
+            }
+            Some((BrainPhase::Ready, turns))
+                if self.spec.brain.kind == BrainKind::Session && turns < self.spec.brain.max_turns =>
+            {
+                let delta = self.brain_delta(&situation);
+                let text = wire::render_turn(&situation, &delta, &self.spec.prompts);
+                let now = self.now;
+                let Some(brain) = self.book.brain.as_mut() else {
+                    return;
+                };
+                brain.phase = BrainPhase::Thinking { ask, since_ms: now };
+                brain.turns += 1;
+                brain.retried = false;
+                let id = brain.id.clone();
+                if let Some(exec) = brain.prompt_exec(text) {
+                    self.run(exec, Purpose::BrainInput(id));
+                }
+                self.brain_mark_seen();
+            }
+            Some((BrainPhase::Ready, turns)) => {
+                let why = if self.spec.brain.kind == BrainKind::Session {
+                    format!("retired after {turns} turns; a fresh session takes over")
+                } else {
+                    "one consultation, one session".to_owned()
+                };
+                self.brain_retire(&why);
+                self.brain_launch(ask, &situation);
+            }
+            Some((BrainPhase::Gone, _)) | None => self.brain_launch(ask, &situation),
+        }
+    }
+
+    fn brain_launch(&mut self, ask: AskId, situation: &Situation) {
+        self.book.next_brain += 1;
+        let id = brain_id(&self.job.id, self.book.next_brain);
+        let prompt = wire::render_prompt(situation, &self.spec.prompts);
+        let req = BrainSession::request(
+            &self.job.id,
+            &self.spec.brain,
+            self.spec.workers.harness,
+            &self.job.repo,
+            prompt.clone(),
+        );
+        match BrainSession::launch(id.clone(), &self.spec.brain, req, prompt, ask.clone(), self.now) {
+            Ok((brain, exec)) => {
+                self.emit(Event::BrainStarted {
+                    session: id.clone(),
+                    harness: brain.harness,
+                    model: brain.model.clone(),
+                });
+                self.book.brain = Some(brain);
+                self.brain_mark_seen();
+                self.run(exec, Purpose::BrainLaunch(id));
+            }
+            Err(e) => {
+                self.book.brain = None;
+                self.brain_launch_failed(&ask, &format!("can't launch the orchestrator's harness: {e}"));
+            }
+        }
+    }
+
+    fn brain_launch_failed(&mut self, ask: &AskId, why: &str) {
+        self.book.brain_launch_failures += 1;
+        if self.book.brain_launch_failures >= BRAIN_LAUNCH_FAILURES && !self.book.brain_disabled {
+            self.book.brain_disabled = true;
+            self.notice(format!(
+                "the orchestrator's harness failed to start {} times; the rules decide from here",
+                self.book.brain_launch_failures
+            ));
+        }
+        self.brain_failed(ask, why);
+        self.brain_pump();
+    }
+
+    fn on_brain_launched(&mut self, id: &str, code: i32, stdout: &str, err: &str) {
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+            return;
+        };
+        if code != 0 {
+            let ask = brain.thinking_about().cloned();
+            brain.phase = BrainPhase::Gone;
+            let remove = brain.remove_exec();
+            self.emit(Event::BrainEnded {
+                session: id.to_owned(),
+                why: format!("starting the harness failed: {err}"),
+            });
+            if let Some(exec) = remove {
+                self.run(exec, Purpose::BrainRemove(id.to_owned()));
+            }
+            if let Some(ask) = ask {
+                self.brain_launch_failed(&ask, &format!("starting the harness failed: {err}"));
+            }
+            return;
+        }
+        self.book.brain_launch_failures = 0;
+        let updates = brain.on_launched(stdout);
+        self.out.push(Effect::Follow {
+            worker: WorkerId(id.to_owned()),
+            host: self.job.host.clone(),
+            offset: 0,
+        });
+        self.on_brain_updates(id, &updates);
+    }
+
+    fn on_brain_bytes(&mut self, id: &str, bytes: &[u8]) {
+        let now = self.now;
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+            return;
+        };
+        let updates = brain.feed(bytes, now);
+        self.on_brain_updates(id, &updates);
+    }
+
+    fn on_brain_log_ended(&mut self, id: &str, code: Option<i32>) {
+        let now = self.now;
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+            return;
+        };
+        let updates = brain.on_exit(code, now);
+        self.on_brain_updates(id, &updates);
+        if self
+            .book
+            .brain
+            .as_ref()
+            .is_some_and(|b| b.id == id && b.is_live())
+        {
+            self.on_brain_exited(id, code);
+        }
+    }
+
+    fn on_brain_updates(&mut self, id: &str, updates: &[Update]) {
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+            return;
+        };
+        let was_replaying = updates.iter().any(|u| u.replay);
+        let obs = brain.observe(updates);
+        let caught_up = was_replaying && !brain.is_replaying();
+        self.job.brain_cost_usd = self.book.brain_cost_retired + brain.cost_usd;
+        for o in obs {
+            self.on_brain_obs(id, o);
+        }
+        if caught_up {
+            self.brain_reconcile(id);
+        }
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id && b.is_live()) else {
+            return;
+        };
+        match brain.answer_requests() {
+            Ok(execs) => {
+                for exec in execs {
+                    self.run(exec, Purpose::BrainInput(id.to_owned()));
+                }
+            }
+            Err(why) => {
+                self.on_brain_obs(id, BrainObs::Auth(why));
+                return;
+            }
+        }
+        let now = self.now;
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id && b.is_live()) else {
+            return;
+        };
+        if let Some(cmds) = brain.deferred_due(now) {
+            brain.deferred = None;
+            if let BrainPhase::Thinking { since_ms, .. } = &mut brain.phase {
+                *since_ms = now;
+            }
+            let mut execs = Vec::new();
+            for cmd in cmds {
+                execs.extend(brain.command_exec(cmd));
+            }
+            for exec in execs {
+                self.run(exec, Purpose::BrainInput(id.to_owned()));
+            }
+        }
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id) else {
+            return;
+        };
+        let (input, spec) = brain.flush();
+        if let Some(exec) = input {
+            self.run(exec, Purpose::BrainInput(id.to_owned()));
+        }
+        if let Some(exec) = spec {
+            self.run(exec, Purpose::BrainSpecWrite(id.to_owned()));
+        }
+    }
+
+    /// After replaying the brain's log on restore: a turn that ended while
+    /// jefe was away is read now.
+    fn brain_reconcile(&mut self, id: &str) {
+        let Some(brain) = self.book.brain.as_ref().filter(|b| b.id == id && b.is_live()) else {
+            return;
+        };
+        if !brain.is_alive() {
+            self.on_brain_exited(id, None);
+            return;
+        }
+        if brain.thinking_about().is_some()
+            && let Some(acc_core::RunState::Done | acc_core::RunState::Idle | acc_core::RunState::Error) =
+                brain.state()
+        {
+            let end = brain.turn_end();
+            self.on_brain_obs(id, end);
+        }
+    }
+
+    fn on_brain_obs(&mut self, id: &str, o: BrainObs) {
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id && b.is_live()) else {
+            return;
+        };
+        match o {
+            BrainObs::TurnDone => {
+                // A turn before the first prompt (held for effort) is nothing.
+                if brain.deferred.is_some() {
+                    return;
+                }
+                let Some(ask) = brain.thinking_about().cloned() else {
+                    brain.phase = BrainPhase::Ready;
+                    return;
+                };
+                let reply = brain.last_message().unwrap_or_default();
+                let source = DecisionSource::Brain {
+                    harness: Some(brain.harness),
+                    model: brain.model.clone(),
+                };
+                let decision = wire::parse_decision(&reply, source);
+                let text = cut(&wire::strip_decision(&reply), BRAIN_TEXT_CHARS);
+                self.emit(Event::BrainTurn {
+                    session: id.to_owned(),
+                    ask: Some(ask.clone()),
+                    text,
+                });
+                let Some(brain) = self.book.brain.as_mut() else {
+                    return;
+                };
+                match decision {
+                    Some(d) => {
+                        brain.phase = BrainPhase::Ready;
+                        if self.spec.brain.kind == BrainKind::Oneshot {
+                            self.brain_retire("one consultation, one session");
+                        }
+                        self.on_decided(ask, d);
+                        self.brain_pump();
+                    }
+                    None if !brain.retried => {
+                        brain.retried = true;
+                        brain.turns += 1;
+                        if let BrainPhase::Thinking { since_ms, .. } = &mut brain.phase {
+                            *since_ms = self.now;
+                        }
+                        if let Some(exec) = brain.prompt_exec(ASK_FOR_BLOCK.to_owned()) {
+                            self.run(exec, Purpose::BrainInput(id.to_owned()));
+                        }
+                    }
+                    None => {
+                        brain.phase = BrainPhase::Ready;
+                        if self.spec.brain.kind == BrainKind::Oneshot {
+                            self.brain_retire("one consultation, one session");
+                        }
+                        self.brain_failed(&ask, "no valid jefe-decision block, twice");
+                        self.brain_pump();
+                    }
+                }
+            }
+            BrainObs::TurnError(message) => {
+                let ask = brain.thinking_about().cloned();
+                brain.phase = BrainPhase::Ready;
+                if let Some(ask) = ask {
+                    self.brain_failed(&ask, &message);
+                }
+                self.brain_pump();
+            }
+            BrainObs::Auth(message) => {
+                let ask = brain.thinking_about().cloned();
+                self.brain_retire(&format!("its harness needs a login: {message}"));
+                if let Some(ask) = ask {
+                    self.brain_failed(
+                        &ask,
+                        &format!("the orchestrator's harness needs a login: {message}"),
+                    );
+                }
+                self.book.brain_disabled = true;
+                self.notice(
+                    "the orchestrator's harness needs a login; the rules decide from here".to_owned(),
+                );
+                self.brain_pump();
+            }
+            BrainObs::Exited(code) => self.on_brain_exited(id, code),
+        }
+    }
+
+    fn on_brain_exited(&mut self, id: &str, code: Option<i32>) {
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.id == id && b.is_live()) else {
+            return;
+        };
+        let ask = brain.thinking_about().cloned();
+        brain.phase = BrainPhase::Gone;
+        self.book.brain_cost_retired += brain.cost_usd;
+        let remove = brain.remove_exec();
+        self.out.push(Effect::Unfollow {
+            worker: WorkerId(id.to_owned()),
+        });
+        self.emit(Event::BrainEnded {
+            session: id.to_owned(),
+            why: format!(
+                "its harness exited ({})",
+                code.map_or("no code".to_owned(), |c| c.to_string())
+            ),
+        });
+        if let Some(exec) = remove {
+            self.run(exec, Purpose::BrainRemove(id.to_owned()));
+        }
+        if let Some(ask) = ask {
+            self.brain_failed(&ask, "the orchestrator's harness exited before deciding");
+        }
+        self.brain_pump();
+    }
+
+    /// Stops the current brain session (its asks are the caller's business).
+    fn brain_retire(&mut self, why: &str) {
+        let Some(brain) = self.book.brain.as_mut().filter(|b| b.is_live()) else {
+            return;
+        };
+        brain.phase = BrainPhase::Gone;
+        self.book.brain_cost_retired += brain.cost_usd;
+        let id = brain.id.clone();
+        let kill = brain.is_alive().then(|| brain.kill_exec()).flatten();
+        let remove = brain.remove_exec();
+        self.out.push(Effect::Unfollow {
+            worker: WorkerId(id.clone()),
+        });
+        self.emit(Event::BrainEnded {
+            session: id.clone(),
+            why: why.to_owned(),
+        });
+        match (kill, remove) {
+            (Some(kill), remove) => {
+                // The files go once the harness has stopped; a later session
+                // may have taken `book.brain` by then, so the exec is kept here.
+                if let Some(remove) = remove {
+                    self.book.brain_removals.insert(id.clone(), remove);
+                }
+                self.run(kill, Purpose::BrainKill(id));
+            }
+            (None, Some(remove)) => self.run(remove, Purpose::BrainRemove(id)),
+            (None, None) => {}
+        }
+    }
+
+    /// Deletes a stopped brain session's files, once its kill is done.
+    fn brain_remove(&mut self, id: &str) {
+        if let Some(exec) = self.book.brain_removals.remove(id) {
+            self.run(exec, Purpose::BrainRemove(id.to_owned()));
+        }
+    }
+
+    /// Puts the next waiting ask to the brain, if it is free.
+    fn brain_pump(&mut self) {
+        if self.book.brain_disabled {
+            // Whatever waited for the brain goes to the rules.
+            let queue = std::mem::take(&mut self.book.brain_queue);
+            for ask in queue {
+                self.decide_by_rules(ask);
+            }
+            return;
+        }
+        if matches!(
+            self.book.brain.as_ref().map(|b| &b.phase),
+            Some(BrainPhase::Thinking { .. } | BrainPhase::Launching)
+        ) {
+            return;
+        }
+        while !self.book.brain_queue.is_empty() {
+            let ask = self.book.brain_queue.remove(0);
+            if self.book.asks.contains_key(&ask) {
+                self.brain_ask(ask);
+                return;
+            }
+        }
+    }
+
+    /// What changed since the brain's last turn.
+    fn brain_delta(&self, s: &Situation) -> serde_json::Value {
+        let seen = &self.book.brain_seen;
+        let tasks: Vec<&TaskView> = s
+            .tasks
+            .iter()
+            .filter(|t| seen.tasks.get(&t.id) != Some(&(t.status, t.attempts, t.worker.clone())))
+            .collect();
+        let workers: Vec<&WorkerView> = s
+            .workers
+            .iter()
+            .filter(|w| seen.workers.get(&w.id) != Some(&w.phase))
+            .collect();
+        let notes: Vec<&String> = s.notes.iter().skip(seen.notes).collect();
+        let rejected = self
+            .book
+            .history
+            .last()
+            .filter(|h| h.ask == s.ask)
+            .and_then(|h| h.rejected.clone());
+        serde_json::json!({
+            "ask": s.ask,
+            "trigger": s.trigger,
+            "focus": s.focus,
+            "allowed": s.allowed,
+            "tasks": tasks,
+            "workers": workers,
+            "notes": notes,
+            "rejected": rejected,
+            "limits": s.limits,
+        })
+    }
+
+    fn brain_mark_seen(&mut self) {
+        let seen = &mut self.book.brain_seen;
+        seen.tasks = self
+            .job
+            .tasks
+            .iter()
+            .map(|t| (t.id.clone(), (t.status, t.attempts, t.worker.clone())))
+            .collect();
+        seen.workers = self
+            .job
+            .workers
+            .iter()
+            .map(|w| (w.id.clone(), w.phase.name().to_owned()))
+            .collect();
+        seen.notes = self.job.notes.len();
+    }
+
     // ---- the human ---------------------------------------------------------------------
 
-    fn ask_human(&mut self, trigger: Trigger, question: String, options: Vec<String>, questions: usize) {
+    fn ask_human(
+        &mut self,
+        trigger: Trigger,
+        question: String,
+        options: Vec<String>,
+        questions: usize,
+        kind: Option<&str>,
+    ) {
         let ask = self.next_ask();
         self.book.human = Some(HumanAsk {
             ask: ask.clone(),
             trigger,
             questions,
+            kind: kind.map(str::to_owned),
         });
-        self.job.status = JobStatus::NeedsHuman;
+        if kind != Some(PLAN_KIND) {
+            self.job.status = JobStatus::NeedsHuman;
+        }
         self.emit(Event::HumanAsked {
             ask: ask.clone(),
             question: question.clone(),
             options: options.clone(),
+            kind: kind.map(str::to_owned),
         });
         self.out.push(Effect::AskHuman {
             ask,
             question,
             options,
+            kind: kind.map(str::to_owned),
         });
     }
 
@@ -1942,17 +2908,30 @@ impl Jefe {
                 self.notice(format!("note from the human: {text}"));
                 self.job.notes.push(text);
             }
+            HumanReply::Message { text, consult } => {
+                if !text.trim().is_empty() {
+                    self.notice(format!("note from the human: {text}"));
+                    self.job.notes.push(text);
+                }
+                if consult && !self.job.status.is_terminal() {
+                    self.consult(Trigger::Nudge, None);
+                }
+            }
             HumanReply::Answer { ask, text } => {
                 let Some(h) = self.book.human.clone() else { return };
                 if ask.as_ref().is_some_and(|a| *a != h.ask) {
                     return;
                 }
                 self.book.human = None;
-                self.job.status = JobStatus::Running;
                 self.emit(Event::HumanAnswered {
                     ask: h.ask.clone(),
                     text: text.clone(),
                 });
+                if h.kind.as_deref() == Some(PLAN_KIND) {
+                    self.on_plan_answer(&text);
+                    return;
+                }
+                self.job.status = JobStatus::Running;
                 let action = self.human_action(&h, &text);
                 let Some(action) = action else {
                     // Plan and wrap-up: the answer is a note for the brain, asked again.
@@ -1979,6 +2958,39 @@ impl Jefe {
         }
     }
 
+    /// The human's answer to the plan: start, or plan again with the
+    /// feedback as a note.
+    fn on_plan_answer(&mut self, text: &str) {
+        let yes = matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes" | "ok" | "approve" | "approved" | "go" | "lgtm" | "start"
+        );
+        if yes {
+            self.job.status = JobStatus::Running;
+            self.emit(Event::PlanApproved);
+            return;
+        }
+        // The planned tasks never started: take them out of the way.
+        let pending: Vec<TaskId> = self
+            .job
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &pending {
+            self.emit(Event::TaskDropped {
+                task: id.clone(),
+                reason: "the plan is being revised".to_owned(),
+            });
+        }
+        self.job.tasks.retain(|t| !pending.contains(&t.id));
+        self.notice(format!("note from the human: {text}"));
+        self.job.notes.push(text.to_owned());
+        self.job.status = JobStatus::Planning;
+        self.consult(Trigger::Plan, None);
+    }
+
     /// What a human's free-text answer means for the question it answers.
     fn human_action(&self, h: &HumanAsk, text: &str) -> Option<Action> {
         let trigger = &h.trigger;
@@ -1987,7 +2999,7 @@ impl Jefe {
             "y" | "yes" | "ok" | "accept" | "lgtm" | "merge"
         );
         match trigger {
-            Trigger::Plan | Trigger::Wrap => None,
+            Trigger::Plan | Trigger::Wrap | Trigger::Nudge => None,
             Trigger::Review { task, .. } if yes => Some(Action::Accept { task: task.clone() }),
             Trigger::Review { task, .. } => Some(Action::Reject {
                 task: task.clone(),
@@ -2058,11 +3070,26 @@ impl Jefe {
                 self.run(exec, Purpose::Input(w.clone()));
             }
         }
+        let deferred: Vec<WorkerId> = self
+            .job
+            .workers
+            .iter()
+            .filter(|w| w.deferred.is_some() && w.is_live())
+            .map(|w| w.id.clone())
+            .collect();
+        for w in deferred {
+            self.send_deferred(&w);
+            self.flush(&w);
+        }
         let stalled: Vec<(WorkerId, u64)> = self
             .job
             .workers
             .iter()
-            .filter(|w| w.is_live() && matches!(w.phase, WorkerPhase::Working | WorkerPhase::Waiting))
+            .filter(|w| {
+                w.is_live()
+                    && w.deferred.is_none()
+                    && matches!(w.phase, WorkerPhase::Working | WorkerPhase::Waiting)
+            })
             .map(|w| (w.id.clone(), self.now.saturating_sub(w.last_progress_ms)))
             .filter(|(_, idle)| *idle > b.stall_ms)
             .collect();
@@ -2079,6 +3106,27 @@ impl Jefe {
                 Trigger::Stalled { worker: w.clone() },
                 Some(Focus::Stall { worker: w, idle_ms }),
             );
+        }
+        self.brain_tick(b.brain_timeout_ms);
+    }
+
+    /// The brain's held-back first prompt, and its turn timeout.
+    fn brain_tick(&mut self, timeout_ms: u64) {
+        let Some(brain) = self.book.brain.as_ref().filter(|b| b.is_live()) else {
+            return;
+        };
+        let id = brain.id.clone();
+        if brain.deferred.is_some() {
+            self.on_brain_updates(&id, &[]);
+            return;
+        }
+        if let BrainPhase::Thinking { ask, since_ms } = &brain.phase
+            && self.now.saturating_sub(*since_ms) > timeout_ms
+        {
+            let ask = ask.clone();
+            self.brain_retire(&format!("no decision within {} s", timeout_ms / 1000));
+            self.brain_failed(&ask, &format!("no decision within {} s", timeout_ms / 1000));
+            self.brain_pump();
         }
     }
 
@@ -2104,12 +3152,12 @@ impl Jefe {
         let mut out: Vec<String> = Vec::new();
         for w in &self.job.workers {
             if w.cwd.is_some() && !w.discarded && !out.contains(&w.branch) {
-                let merged = w
+                let landed = w
                     .task
                     .as_ref()
                     .and_then(|t| self.job.task(t))
-                    .is_some_and(|t| t.status == TaskStatus::Merged);
-                if !merged {
+                    .is_some_and(|t| t.status.landed());
+                if !landed && w.config.access == Access::Worktree {
                     out.push(w.branch.clone());
                 }
             }
@@ -2157,7 +3205,9 @@ impl Jefe {
         for w in live {
             self.kill(&w);
         }
+        self.brain_retire("the job is over");
         self.book.asks.clear();
+        self.book.brain_queue.clear();
         self.book.human = None;
         self.book.merge_queue.clear();
         self.job.status = status;
@@ -2188,4 +3238,13 @@ fn tail(text: &str, max: usize) -> String {
     }
     let skip = n - max;
     format!("…{}", text.chars().skip(skip).collect::<String>())
+}
+
+/// `text` cut to `max` bytes at a character boundary, saying so.
+fn cut(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let end = (0..=max).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+    format!("{}\n[cut at {max} characters]", &text[..end])
 }

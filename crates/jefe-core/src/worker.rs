@@ -1,7 +1,7 @@
 //! A worker: one acc session in one worktree. This is the only module that
 //! drives `acc_core::session::Session`, so an acc bump stays local.
 
-use acc_core::command::Command;
+use acc_core::command::{Command, OptionId};
 use acc_core::event::{ItemKind, Plan, Quota, Usage};
 use acc_core::policy::{Decision as PolicyDecision, Policy, Rule};
 use acc_core::session::{LaunchRequest, Outbound, Permission, Session, SessionError, SessionSpec, Update};
@@ -9,9 +9,68 @@ use acc_core::{BlockKind, Event as AccEvent, Exec, Harness, RunState};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{HostId, TaskId, WorkerId};
+use crate::job::ResolvedWorker;
 
 /// How jefe names itself to acc (request ids, spec files).
 pub const CLIENT_TAG: &str = "jefe";
+
+/// How long a new session waits for its harness to list its options before
+/// its first prompt goes without the effort it was meant to run at.
+pub const DEFER_MS: u64 = 45_000;
+/// Once the harness has listed some options, how long to wait for the rest
+/// (pi lists models and effort levels in separate replies).
+pub const SETTLE_MS: u64 = 5_000;
+
+/// A first prompt held back until the harness lists its effort levels, so
+/// the first turn already runs at the effort asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deferred {
+    pub prompt: String,
+    pub effort: String,
+    pub settle_ms: u64,
+    pub until_ms: u64,
+}
+
+impl Deferred {
+    pub fn new(prompt: String, effort: String, now_ms: u64) -> Self {
+        Self {
+            prompt,
+            effort,
+            settle_ms: now_ms.saturating_add(SETTLE_MS),
+            until_ms: now_ms.saturating_add(DEFER_MS),
+        }
+    }
+
+    /// When the loop must look again, if the options haven't come by then.
+    pub fn deadline(&self) -> u64 {
+        self.settle_ms
+    }
+
+    /// The commands to send now, if the harness has listed its options or
+    /// the wait is over: the effort when it is on offer, then the prompt.
+    pub fn due(&self, session: &Session, now_ms: u64) -> Option<Vec<Command>> {
+        if session.is_replaying() || !session.is_alive() {
+            return None;
+        }
+        let options = session.options();
+        let effort = options
+            .iter()
+            .find(|o| o.id == OptionId::Effort && !o.values.is_empty());
+        let some = options.iter().any(|o| !o.values.is_empty());
+        if effort.is_none() && now_ms < self.until_ms && !(some && now_ms >= self.settle_ms) {
+            return None;
+        }
+        let mut cmds = Vec::new();
+        if effort.is_some_and(|o| o.values.contains(&self.effort)) {
+            cmds.push(Command::SetOption {
+                id: OptionId::Effort,
+                value: self.effort.clone(),
+            });
+        }
+        cmds.push(Command::prompt(self.prompt.clone()));
+        Some(cmds)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -81,7 +140,10 @@ pub enum Obs {
 pub struct Worker {
     pub id: WorkerId,
     pub task: Option<TaskId>,
+    /// The harness it runs now (a handoff changes it).
     pub harness: Harness,
+    /// Its role's settings as resolved when it was spawned.
+    pub config: ResolvedWorker,
     pub host: HostId,
     /// The acc worktree it works in; a replacement keeps its predecessor's.
     pub worktree: String,
@@ -110,6 +172,9 @@ pub struct Worker {
     /// request, not an exec: the session is only built when it launches, so
     /// a restart in between loses nothing.
     pub pending_launch: Option<LaunchRequest>,
+    /// Its first prompt, waiting for the harness to list effort levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<Deferred>,
     /// Writes that were running when jefe stopped, sent again at
     /// `resend_at` unless the worker shows signs of life first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -126,7 +191,7 @@ impl Worker {
     pub fn new(
         id: WorkerId,
         task: TaskId,
-        harness: Harness,
+        config: ResolvedWorker,
         host: HostId,
         worktree: String,
         now_ms: u64,
@@ -135,7 +200,8 @@ impl Worker {
         Self {
             id,
             task: Some(task),
-            harness,
+            harness: config.harness,
+            config,
             host,
             worktree,
             branch,
@@ -153,6 +219,7 @@ impl Worker {
             discarded: false,
             handled: Vec::new(),
             pending_launch: None,
+            deferred: None,
             unsent: Vec::new(),
             resend_at: None,
             session_snapshot: None,
@@ -263,6 +330,12 @@ impl Worker {
             .as_mut()
             .map(|s| s.on_exit_file(&text, now_ms))
             .unwrap_or_default()
+    }
+
+    /// The commands a held-back first prompt is ready to go out with.
+    pub fn deferred_due(&self, now_ms: u64) -> Option<Vec<Command>> {
+        let d = self.deferred.as_ref()?;
+        d.due(self.session.as_ref()?, now_ms)
     }
 
     /// What `updates` mean, keeping plan, usage and quota up to date.

@@ -6,6 +6,8 @@ Your task: {{task_title}}
 
 {{task_brief}}
 
+{{role_prompt}}
+{{inputs}}
 You are in your own git worktree on branch `{{branch}}`. Other workers have their own.
 
 - Commit your work on this branch with clear messages. Never push, and never touch other branches or the main checkout.

@@ -32,6 +32,9 @@ pub enum Message {
         ask: AskId,
         question: String,
         options: Vec<String>,
+        /// `plan` when the plan waits for approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     Snapshot {
         job: serde_json::Value,
@@ -112,13 +115,14 @@ impl Output {
         }
     }
 
-    pub fn ask(&mut self, ask: &AskId, question: &str, options: &[String]) {
+    pub fn ask(&mut self, ask: &AskId, question: &str, options: &[String], kind: Option<&str>) {
         self.options = options.to_vec();
         match self.mode {
             Mode::Json => self.message(Message::Ask {
                 ask: ask.clone(),
                 question: question.to_owned(),
                 options: options.to_vec(),
+                kind: kind.map(str::to_owned),
             }),
             Mode::Prose => {
                 let mut text = format!("needs you: {question}");
@@ -189,6 +193,7 @@ fn short<'a>(job: &JobId, id: &'a str) -> &'a str {
 fn status_word(s: JobStatus) -> &'static str {
     match s {
         JobStatus::Planning => "planning",
+        JobStatus::AwaitingApproval => "awaiting approval",
         JobStatus::Running => "running",
         JobStatus::NeedsHuman => "needs a human",
         JobStatus::Done => "done",
@@ -221,7 +226,24 @@ pub fn describe(e: &Event, job: &JobId) -> Option<String> {
             1 => "planned 1 task".to_owned(),
             n => format!("planned {n} tasks"),
         },
-        Event::TaskAdded { task, title, .. } => format!("  {task}: {title}"),
+        Event::PlanApproved => "plan approved".to_owned(),
+        Event::TaskAdded {
+            task, title, role, ..
+        } => format!("  {task} [{role}]: {title}"),
+        Event::Artifact { task, role, chars } => format!("{task} ({role}) reported ({chars} chars)"),
+        Event::BrainStarted {
+            session,
+            harness,
+            model,
+        } => format!(
+            "orchestrator {} started ({}{})",
+            short(job, session),
+            harness_name(*harness),
+            model.as_deref().map(|m| format!(", {m}")).unwrap_or_default()
+        ),
+        Event::BrainTurn { text, .. } => format!("orchestrator: {}", first_line(text)),
+        Event::BrainEnded { session, why } => format!("orchestrator {} ended: {why}", short(job, session)),
+        Event::LeaseLost { holder } => format!("{holder} took this job over; this client stops driving it"),
         Event::TaskDropped { task, reason } => format!("dropped {task}: {reason}"),
         Event::TaskFailed { task, reason } => format!("{task} failed: {reason}"),
         Event::WorkerSpawned {
@@ -229,8 +251,9 @@ pub fn describe(e: &Event, job: &JobId) -> Option<String> {
             task,
             harness,
             branch,
+            role,
         } => format!(
-            "{} ({}) started on {task} → {branch}",
+            "{} ({}, {role}) started on {task} → {branch}",
             w(worker),
             harness_name(*harness)
         ),
@@ -284,6 +307,7 @@ pub fn describe(e: &Event, job: &JobId) -> Option<String> {
             let who = match &decision.source {
                 DecisionSource::Rules => return None,
                 DecisionSource::Human => "you".to_owned(),
+                DecisionSource::Reviewer { task } => format!("reviewer {task}"),
                 DecisionSource::Brain { harness, model } => model
                     .clone()
                     .or_else(|| harness.map(harness_name))
@@ -357,7 +381,7 @@ pub fn exit_code(status: JobStatus) -> i32 {
         JobStatus::Done => 0,
         JobStatus::Failed => 2,
         JobStatus::Cancelled => 3,
-        JobStatus::NeedsHuman | JobStatus::Planning | JobStatus::Running => 4,
+        JobStatus::NeedsHuman | JobStatus::Planning | JobStatus::AwaitingApproval | JobStatus::Running => 4,
     }
 }
 

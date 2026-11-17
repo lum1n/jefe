@@ -6,6 +6,7 @@
 //! anything is choosing an action.
 
 pub mod rules;
+pub mod session;
 pub mod wire;
 
 use acc_core::Harness;
@@ -13,10 +14,11 @@ use acc_core::event::{Plan, Quota};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AskId, TaskId, WorkerId};
-use crate::job::{TaskKind, TaskSpec, TaskStatus};
-use crate::result::WorkerResult;
+use crate::job::{Access, TaskKind, TaskSpec, TaskStatus};
+use crate::result::{Verdict, WorkerResult};
 
 pub use rules::RulesBrain;
+pub use session::BrainSession;
 
 /// Why the brain is asked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,8 @@ pub enum Trigger {
     Quota { worker: WorkerId },
     /// Every task is finished: done, or more to do?
     Wrap,
+    /// The human wrote to the orchestrator and asked for a turn.
+    Nudge,
 }
 
 impl Trigger {
@@ -60,6 +64,7 @@ impl Trigger {
             Self::Stalled { .. } => "stalled",
             Self::Quota { .. } => "quota",
             Self::Wrap => "wrap",
+            Self::Nudge => "nudge",
         }
     }
 
@@ -74,7 +79,7 @@ impl Trigger {
             | Self::Auth { worker }
             | Self::Stalled { worker }
             | Self::Quota { worker } => Some(worker),
-            Self::Plan | Self::Wrap => None,
+            Self::Plan | Self::Wrap | Self::Nudge => None,
         }
     }
 }
@@ -232,6 +237,10 @@ pub enum DecisionSource {
     },
     Rules,
     Human,
+    /// A reviewer worker's verdict (`[review] by = "reviewer"`).
+    Reviewer {
+        task: TaskId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,6 +287,9 @@ pub struct Situation {
     /// The default worker harness and the ones to hand off to.
     pub harness: Harness,
     pub alternates: Vec<Harness>,
+    /// The roles a plan may give tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<RoleView>,
     pub limits: Limits,
     pub tasks: Vec<TaskView>,
     pub workers: Vec<WorkerView>,
@@ -298,12 +310,25 @@ pub struct Limits {
     pub max_turns_per_worker: u32,
 }
 
+/// A role as the brain sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleView {
+    pub id: String,
+    pub description: String,
+    pub access: Access,
+    pub harness: Harness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub id: TaskId,
     pub title: String,
     pub brief: String,
     pub kind: TaskKind,
+    #[serde(default = "crate::job::default_role_name")]
+    pub role: String,
     pub status: TaskStatus,
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -311,12 +336,17 @@ pub struct TaskView {
     pub worker: Option<WorkerId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The start of a report task's report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerView {
     pub id: WorkerId,
     pub task: Option<TaskId>,
+    #[serde(default = "crate::job::default_role_name")]
+    pub role: String,
     pub harness: Harness,
     pub phase: String,
     pub turns: u32,
@@ -337,6 +367,9 @@ pub enum Focus {
         task: TaskId,
         result: WorkerResult,
         diff: String,
+        /// What the reviewer worker said, when one read the diff first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<ReviewView>,
     },
     Report {
         task: TaskId,
@@ -372,6 +405,15 @@ pub enum Focus {
         worker: WorkerId,
         message: String,
     },
+}
+
+/// A reviewer worker's report on a task's diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewView {
+    /// The review task.
+    pub task: TaskId,
+    pub verdict: Option<Verdict>,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

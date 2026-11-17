@@ -1,6 +1,7 @@
 //! A job's directory: `job.json` (the latest snapshot), `events.ndjson`,
 //! `inputs.ndjson` (everything fed to the loop, for replay), `report.md`,
-//! `brain.json`, `host.json`, `workers/<id>/final.md`, and `pid` while a jefe process drives it.
+//! `host.json`, `brain/<ask>.md` (the orchestrator's replies),
+//! `workers/<id>/final.md`, and `pid` while a jefe process drives it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -15,6 +16,10 @@ pub struct Store {
     dir: PathBuf,
     events: File,
     inputs: File,
+    /// Write `job.json` and `events.ndjson` here. Off when the job's
+    /// host-side store is this very directory (`--state host` on this
+    /// machine), which writes them itself.
+    mirror: bool,
 }
 
 /// One line of `inputs.ndjson`.
@@ -45,9 +50,16 @@ impl Store {
             events: append("events.ndjson")?,
             inputs: append("inputs.ndjson")?,
             dir,
+            mirror: true,
         };
         write_atomic(&store.dir.join("pid"), std::process::id().to_string().as_bytes())?;
         Ok(store)
+    }
+
+    /// Leaves `job.json` and `events.ndjson` to the host-side store.
+    pub fn without_mirror(mut self) -> Self {
+        self.mirror = false;
+        self
     }
 
     pub fn dir(&self) -> &Path {
@@ -55,10 +67,16 @@ impl Store {
     }
 
     pub fn save(&self, snapshot: &str) -> anyhow::Result<()> {
+        if !self.mirror {
+            return Ok(());
+        }
         write_atomic(&self.dir.join("job.json"), snapshot.as_bytes())
     }
 
     pub fn event(&mut self, s: &Stamped) -> anyhow::Result<()> {
+        if !self.mirror {
+            return Ok(());
+        }
         line(&mut self.events, s)
     }
 
@@ -73,12 +91,17 @@ impl Store {
         )
     }
 
-    /// Which brain the job runs with, for `attach`.
-    pub fn save_brain(&self, brain: Option<&crate::brain::HarnessBrain>) -> anyhow::Result<()> {
-        write_atomic(
-            &self.dir.join("brain.json"),
-            serde_json::to_string(&brain)?.as_bytes(),
-        )
+    /// Appends a section to the orchestrator's exchange for `ask`
+    /// (`brain/<ask>.md`).
+    pub fn brain_log(&self, ask: &str, heading: &str, text: &str) -> anyhow::Result<()> {
+        let dir = self.dir.join("brain");
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{ask}.md")))?;
+        writeln!(f, "## {heading}\n\n{}\n", text.trim_end())?;
+        Ok(())
     }
 
     /// A worker's last message when it reports, as `workers/<id>/final.md`.
@@ -94,6 +117,15 @@ impl Store {
             &self.dir.join("host.json"),
             serde_json::to_string(host)?.as_bytes(),
         )
+    }
+
+    /// Whether the job's state is also kept on its host, for `attach`.
+    pub fn save_state(&self, state: crate::StateMode) -> anyhow::Result<()> {
+        let text = match state {
+            crate::StateMode::Local => "local",
+            crate::StateMode::Host => "host",
+        };
+        write_atomic(&self.dir.join("state"), text.as_bytes())
     }
 
     /// Gives the job up: another process may drive it now.
@@ -122,20 +154,21 @@ pub fn load(id: &str) -> anyhow::Result<String> {
     fs::read_to_string(&path).with_context(|| format!("no job {id} ({})", path.display()))
 }
 
-/// The harness brain job `id` was started with; `None` for the rules.
-pub fn load_brain(id: &str) -> anyhow::Result<Option<crate::brain::HarnessBrain>> {
-    match fs::read_to_string(Store::dir_for(id).join("brain.json")) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// The host job `id` runs on; this machine when it never saved one.
 pub fn load_host(id: &str) -> anyhow::Result<crate::hosts::JobHost> {
     match fs::read_to_string(Store::dir_for(id).join("host.json")) {
         Ok(text) => Ok(serde_json::from_str(&text)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::hosts::JobHost::local()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Where job `id` keeps its state; local when it never said.
+pub fn load_state(id: &str) -> anyhow::Result<crate::StateMode> {
+    match fs::read_to_string(Store::dir_for(id).join("state")) {
+        Ok(text) if text.trim() == "host" => Ok(crate::StateMode::Host),
+        Ok(_) => Ok(crate::StateMode::Local),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::StateMode::Local),
         Err(e) => Err(e.into()),
     }
 }

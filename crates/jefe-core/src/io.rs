@@ -22,7 +22,8 @@ pub enum Input {
         stdout: String,
         stderr: String,
     },
-    /// Bytes a worker's log gained, from the offset of its [`Effect::Follow`].
+    /// Bytes a followed log gained, from the offset of its [`Effect::Follow`].
+    /// `worker` is a worker's id or the orchestrator's session id.
     /// Serialized as a string when they are UTF-8 (logs are NDJSON), else as
     /// an array of numbers.
     Bytes {
@@ -30,7 +31,7 @@ pub enum Input {
         #[serde(with = "text_or_bytes")]
         bytes: Vec<u8>,
     },
-    /// A worker's log ended: the harness exited.
+    /// A followed log ended: the harness exited.
     LogEnded {
         worker: WorkerId,
         code: Option<i32>,
@@ -57,6 +58,14 @@ pub enum HumanReply {
     Cancel,
     /// A note for the brain.
     Nudge { text: String },
+    /// A message to the orchestrator: a note, and with `consult` a turn of
+    /// its own right away (the `nudge` trigger). An empty `text` with
+    /// `consult` just asks for the turn.
+    Message {
+        text: String,
+        #[serde(default)]
+        consult: bool,
+    },
 }
 
 /// What the host must do.
@@ -70,8 +79,9 @@ pub enum Effect {
         exec: Exec,
         purpose: Purpose,
     },
-    /// Follow the worker's log from `offset`: send each chunk as
-    /// [`Input::Bytes`] and the end as [`Input::LogEnded`].
+    /// Follow the session's log from `offset`: send each chunk as
+    /// [`Input::Bytes`] and the end as [`Input::LogEnded`]. `worker` is a
+    /// worker's id or the orchestrator's session id.
     Follow {
         worker: WorkerId,
         host: HostId,
@@ -81,15 +91,20 @@ pub enum Effect {
         worker: WorkerId,
     },
     /// Ask the brain; answer with [`Input::Decided`] or [`Input::BrainFailed`].
+    /// Only with `[orchestrator] kind = "rules"`: other kinds run the brain
+    /// as a session through `Run` and `Follow`.
     Consult {
         ask: AskId,
         situation: Box<Situation>,
     },
-    /// Ask the human; answer with [`HumanReply::Answer`].
+    /// Ask the human; answer with [`HumanReply::Answer`]. `kind` is `plan`
+    /// when the plan waits for approval.
     AskHuman {
         ask: AskId,
         question: String,
         options: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// Show or record an event.
     Emit(Stamped),
@@ -120,6 +135,17 @@ pub enum Purpose {
     Discard(WorkerId),
     Kill(WorkerId),
     Remove(WorkerId),
+    /// The orchestrator's session (its id).
+    BrainLaunch(String),
+    BrainInput(String),
+    BrainStatus(String),
+    BrainSpecWrite(String),
+    BrainKill(String),
+    BrainRemove(String),
+    /// Host-side state ([`crate::store`]), added by [`crate::hosted::Hosted`].
+    Save,
+    Lease,
+    Release,
 }
 
 /// Log bytes as a JSON string when they are valid UTF-8, which they are
@@ -172,5 +198,19 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"bytes\":\"hi\""), "{json}");
+    }
+
+    #[test]
+    fn a_message_reads_with_or_without_consult() {
+        let m: HumanReply = serde_json::from_str(r#"{"cmd":"message","text":"hi"}"#).unwrap();
+        assert_eq!(
+            m,
+            HumanReply::Message {
+                text: "hi".to_owned(),
+                consult: false
+            }
+        );
+        let m: HumanReply = serde_json::from_str(r#"{"cmd":"message","text":"","consult":true}"#).unwrap();
+        assert!(matches!(m, HumanReply::Message { consult: true, .. }));
     }
 }

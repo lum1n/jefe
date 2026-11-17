@@ -128,7 +128,12 @@ impl JobHost {
     /// auth and host key errors early.
     pub fn open(&self) -> anyhow::Result<Arc<Host>> {
         match &self.ssh {
-            None => Ok(Arc::new(Host::local())),
+            // Scripts on this machine keep jefe's own state directory, so
+            // `--state host` lands where `JEFE_STATE_DIR` says.
+            None => Ok(Arc::new(Host::local_keeping([
+                "JEFE_STATE_DIR",
+                "XDG_STATE_HOME",
+            ]))),
             Some(c) => {
                 let config = c.ssh_config().with_context(|| format!("host {}", self.name))?;
                 Ok(Arc::new(Host::new(config)))

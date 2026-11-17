@@ -143,8 +143,16 @@ pub fn worker_rules(extra: &[Rule]) -> Vec<Rule> {
 /// The brain's rules: reading and a few read-only commands; edits denied.
 /// Anything else no rule matches is rejected by the host.
 pub fn brain_rules() -> Vec<Rule> {
+    read_only_rules(&[])
+}
+
+/// A read-only worker's rules (explorer, researcher, reviewer): the brain's,
+/// then `extra` from the config. Deny wins over allow in acc, so `extra`
+/// can't let it edit.
+pub fn read_only_rules(extra: &[Rule]) -> Vec<Rule> {
     let mut out = vec![tool(Decision::Deny, "edit"), tool(Decision::Allow, "read")];
     out.extend(BRAIN_ALLOW.iter().map(|c| shell(Decision::Allow, c)));
+    out.extend(extra.iter().cloned());
     out
 }
 
@@ -202,5 +210,25 @@ mod tests {
     fn the_brain_only_reads() {
         assert_eq!(decide(brain_rules(), "git log -3"), Some(Decision::Allow));
         assert_eq!(decide(brain_rules(), "cargo test"), None);
+    }
+
+    #[test]
+    fn read_only_workers_may_be_allowed_more_commands_but_never_edits() {
+        let extra = [
+            shell(Decision::Allow, "cargo test"),
+            tool(Decision::Allow, "edit"),
+        ];
+        let rules = read_only_rules(&extra);
+        assert_eq!(decide(rules.clone(), "cargo test"), Some(Decision::Allow));
+        let req = Request {
+            tool: Some("Edit".to_owned()),
+            kind: Some(ToolKind::Edit),
+            command: None,
+            paths: vec!["/w/a.rs".to_owned()],
+        };
+        assert_eq!(
+            Policy { rules }.decide(&req, "/w").map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
     }
 }

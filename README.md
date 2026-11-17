@@ -4,6 +4,8 @@ jefe is a chief orchestrator. You give it a goal and a repository; it plans the 
 
 It runs on [acc](https://github.com/lum1n/acc), so the agents can be Claude Code, Codex, Cursor, Copilot, opencode or pi, on this machine or over SSH.
 
+Workers have roles: an **explorer** maps the code, a **researcher** looks things up, an **implementor** writes code in its worktree, a **tester** writes and runs tests, a **reviewer** reads a diff and gives a verdict. The first two and the last report instead of merging; every role can run its own harness, model and effort (`[roles.<id>]`). The orchestrator ("brain") can be the built-in rules, or a model of your choice in a session of its own that lasts the whole job, remembers the plan and your notes, and can be chatted with. Plans can wait for your approval. Job state can live on the job's host, so another client (the Sessh desktop and iOS apps embed jefe) can pick a job up.
+
 jefe talks prose when you run it yourself. When another program embeds it, it speaks NDJSON (`--json`, protocol version 1, see [docs/PROTOCOL.md](docs/PROTOCOL.md)). The supervision loop is a sans-IO crate, `jefe-core`, that other programs can drive directly (see [docs/EMBED.md](docs/EMBED.md)).
 
 **Status:** 0.1.0, early. Jobs run on this machine or on an SSH host. See `CHANGELOG.md`.
@@ -11,7 +13,10 @@ jefe talks prose when you run it yourself. When another program embeds it, it sp
 ```
 jefe "add a --version flag"            # in the repository, on its base branch
 jefe "..." --json --unattended         # NDJSON for programs; never waits on a human
-jefe "..." --brain harness             # a model decides at judgment points, not the rules
+jefe "..." --brain session             # a model orchestrates, in one session for the whole job
+jefe "..." --brain oneshot             # a fresh session per judgment point
+jefe "..." --approve-plan              # show you the plan first (default when attended)
+jefe "..." --state host                # keep the job's state on the host too, with a lease
 jefe "..." --host box --repo /src/proj # workers on [hosts.box], over SSH
 jefe status [JOB] [--json] [--live]    # the latest job by default; --live follows it
 jefe jobs [--json]
@@ -30,9 +35,9 @@ Exit codes: 0 done, 1 jefe failed (bad input, config, unreachable host), 2 faile
 
 With `--host <name>`, the workers, the brain and the merges run on a host from `[hosts.<name>]` in the config. jefe reaches it over SSH, using the SSH agent or an unencrypted `identity` file, and checks its key against `~/.ssh/known_hosts` or pinned `fingerprints`. Nothing needs to be installed there except git and the harness. `--repo` is then an absolute path on that host.
 
-With `--brain harness` (or `[brain] kind = "harness"`), each judgment point (plan, review, questions, failures, wrap-up) is a one-shot session on your own harness in the repository, under a read-only policy, inside acc's read-only sandbox unless `[brain] sandbox = false`. It answers with one action from the allowed set, which jefe checks before acting; when it fails, times out or gives no valid decision twice, the rules decide. Each exchange is saved to `brain/<ask>.md` in the job's directory.
+With `--brain session` (or `[orchestrator] kind = "session"`), the orchestrator is one acc session on your own harness in the repository, under a read-only policy, inside acc's read-only sandbox unless `sandbox = false`. Its first turn gets the whole situation; each later judgment point (plan, review, questions, failures, wrap-up) is a new turn with what changed since. It answers with one action from the allowed set, which jefe checks before acting; when it fails, times out or gives no valid decision twice, the rules decide. After `max_turns` a fresh session is seeded with the situation. `--brain oneshot` starts a fresh session per judgment point instead. Each exchange is saved to `brain/<ask>.md` in the job's directory. Reviews can go through a reviewer worker first (`[review] by = "both"`, the default when the role is on) or be left to it (`"reviewer"`).
 
-Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.local/state/jefe/jobs/<id>/` (`$JEFE_STATE_DIR`): `job.json`, `events.ndjson`, `inputs.ndjson`, `report.md`, `brain.json`, `host.json` and each worker's last message in `workers/<id>/final.md`. You can override prompts per repository in `.jefe/prompts/{worker,chief}.md`, on SSH hosts too.
+Config lives at `~/.config/jefe/jefe.toml` (`$JEFE_CONFIG`), job state at `~/.local/state/jefe/jobs/<id>/` (`$JEFE_STATE_DIR`): `job.json`, `events.ndjson`, `inputs.ndjson`, `report.md`, `host.json`, `state` and each worker's last message in `workers/<id>/final.md`. With `--state host` the host gets `job.json`, `events.ndjson`, `meta` and a `lease` too. You can override prompts per repository in `.jefe/prompts/{worker,chief,chief_turn}.md` and `.jefe/prompts/roles/<role>.md`, on SSH hosts too.
 
 ## Layout
 

@@ -30,12 +30,16 @@ pub enum Event {
     Planned {
         tasks: Vec<TaskId>,
     },
+    /// The human approved the plan; workers may start.
+    PlanApproved,
     TaskAdded {
         task: TaskId,
         title: String,
         kind: TaskKind,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         depends_on: Vec<TaskId>,
+        #[serde(default = "crate::job::default_role_name")]
+        role: String,
     },
     TaskDropped {
         task: TaskId,
@@ -45,11 +49,20 @@ pub enum Event {
         task: TaskId,
         reason: String,
     },
+    /// A report task finished: its report is in the snapshot and goes to
+    /// the tasks that depend on it.
+    Artifact {
+        task: TaskId,
+        role: String,
+        chars: usize,
+    },
     WorkerSpawned {
         worker: WorkerId,
         task: TaskId,
         harness: Harness,
         branch: String,
+        #[serde(default = "crate::job::default_role_name")]
+        role: String,
     },
     WorkerPrompted {
         worker: WorkerId,
@@ -119,6 +132,25 @@ pub enum Event {
         action: Action,
         why: String,
     },
+    /// The orchestrator's harness session started (`[orchestrator] kind`
+    /// other than `rules`). Open it as a read-only agent view.
+    BrainStarted {
+        session: String,
+        harness: Harness,
+        model: Option<String>,
+    },
+    /// The orchestrator replied: `text` is what it said without its decision
+    /// block, `ask` the consultation it answered.
+    BrainTurn {
+        session: String,
+        ask: Option<AskId>,
+        text: String,
+    },
+    /// The orchestrator's session is over (retired, exited or timed out).
+    BrainEnded {
+        session: String,
+        why: String,
+    },
     Reviewed {
         task: TaskId,
         accepted: bool,
@@ -140,10 +172,17 @@ pub enum Event {
         ask: AskId,
         question: String,
         options: Vec<String>,
+        /// What kind of answer: `plan` for the plan's approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     HumanAnswered {
         ask: AskId,
         text: String,
+    },
+    /// Another client took the job's lease; this one stops driving.
+    LeaseLost {
+        holder: String,
     },
     JobDone {
         summary: String,
