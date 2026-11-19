@@ -17,7 +17,7 @@ Every line has a `type`.
 |---|---|---|
 | `hello` | `version`, `job`, `jefe` (jefe's version), `acc` (acc's version) | first line of a run or attach |
 | `event` | `seq`, `at_ms`, `job`, `event` | each thing that happened; `seq` increases by one per job, across attaches |
-| `ask` | `ask`, `question`, `options` (may be empty), `kind?` (`plan`: the plan waits for approval) | jefe needs a human answer (attended jobs only) |
+| `ask` | `ask`, `question`, `options` (may be empty), `kind?` (`plan`: the plan waits for approval; `finish`: the result waits for review) | jefe needs a human answer (attended jobs only) |
 | `snapshot` | `job` | answer to `{"cmd":"status"}` |
 | `error` | `code`, `message` | see below |
 | `bye` | `status` (`done`, `failed` or `cancelled`) | last line of a job that ended |
@@ -43,7 +43,9 @@ Control is read when the job is attended, which is the default with `--json`. `-
 | `{"cmd":"cancel"}` | stops the job and keeps every branch; ends with `job_cancelled` and `bye` |
 | `{"cmd":"status"}` | prints a `snapshot` |
 
-How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On an approval, `y`, `yes`, `ok` or `allow` grant it, and anything else denies it. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again. On the plan's approval (`ask.kind` is `plan`), `approve`, `y`, `yes`, `ok`, `go`, `lgtm` or `start` let the workers begin (`plan_approved`); anything else drops the planned tasks (`task_dropped`), becomes a note and the orchestrator plans again.
+How an answer is read depends on what was asked. On a review, `y`, `yes`, `ok`, `accept`, `lgtm` or `merge` accept the task, and anything else rejects it with the text as feedback. A worker's question gets the text as its answer. On an approval, `y`, `yes`, `ok` or `allow` grant it, and anything else denies it. On a login or exit problem, any answer respawns the worker. At planning and wrap-up, the text becomes a note and the brain is asked again. On the plan's approval (`ask.kind` is `plan`), `approve`, `y`, `yes`, `ok`, `go`, `lgtm` or `start` let the workers begin (`plan_approved`); anything else drops the planned tasks (`task_dropped`), becomes a note and the orchestrator plans again. On the result's review (`ask.kind` is `finish`), `finish`, `done`, `y`, `yes`, `ok` or `lgtm` end the job (`job_done` with the orchestrator's summary); anything else becomes a note, the job goes back to wrap-up and the orchestrator is asked again: it can plan more tasks, or say done again, which asks again.
+
+An attended job reviews its result by default: when the orchestrator says the job is done, jefe asks with `kind: finish` while the workers and the orchestrator's session are still alive. The spec's `approve_finish` (`[finish] approve` in the config, `--approve-finish` / `--no-approve-finish`) turns this on or off; unset, it follows `attended`. While the result waits for review, the wall-clock limit does not fail the job.
 
 ## Events
 

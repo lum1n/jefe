@@ -725,6 +725,24 @@ fn the_plan_waits_for_approval_over_json() {
     )
     .unwrap();
     stdin.flush().unwrap();
+    // Done: the result waits for review before the job ends.
+    let review = loop {
+        let v = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("no review ask arrived");
+        if v["type"] == "ask" {
+            break v;
+        }
+    };
+    assert_eq!(review["kind"], "finish", "{review}");
+    assert_eq!(review["options"], serde_json::json!(["finish"]));
+    writeln!(
+        stdin,
+        r#"{{"cmd":"answer","ask":"{}","text":"finish"}}"#,
+        review["ask"].as_str().unwrap()
+    )
+    .unwrap();
+    stdin.flush().unwrap();
     let status = child.wait().unwrap();
     let lines = reader.join().unwrap();
     assert_eq!(status.code(), Some(0), "{lines:?}");

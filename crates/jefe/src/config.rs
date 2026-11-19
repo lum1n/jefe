@@ -26,6 +26,7 @@ pub struct Config {
     pub limits: Limits,
     pub review: Review,
     pub plan: Plan,
+    pub finish: Finish,
     pub merge: Merge,
     /// SSH hosts for `--host <name>`.
     pub hosts: BTreeMap<String, HostConfig>,
@@ -194,6 +195,14 @@ pub struct Plan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Finish {
+    /// Wait for the human's review of the result before the job ends.
+    /// Unset: when attended.
+    pub approve: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Merge {
     pub squash: bool,
 }
@@ -263,6 +272,9 @@ max_report_chars = 20000
 [plan]
 # approve = true          # wait for your OK before workers start (default: when attended)
 
+[finish]
+# approve = true          # review the result before the job ends (default: when attended)
+
 [merge]
 squash = false
 
@@ -302,6 +314,7 @@ pub fn preset_toml(p: &jefe_core::TeamPreset) -> String {
     config.limits.max_cost_usd = spec.budget.max_cost_usd;
     config.review.by = spec.review_by;
     config.plan.approve = spec.approve_plan;
+    config.finish.approve = spec.approve_finish;
     let mut text = format!("# {}\n", p.name);
     text.push_str(&toml::to_string(&config).unwrap_or_default());
     text
@@ -408,6 +421,7 @@ impl Config {
         spec.brain = self.brain_spec();
         spec.budget = self.budget();
         spec.approve_plan = self.plan.approve;
+        spec.approve_finish = self.finish.approve;
         spec.review_by = self.review.by;
         spec.squash = self.merge.squash;
         spec.max_diff_chars = self.review.max_diff_chars;
@@ -495,7 +509,7 @@ mod tests {
     fn roles_review_and_plan_reach_the_spec() {
         let c = Config::parse(
             "[roles.explorer]\nharness = \"pi\"\neffort = \"low\"\n[roles.tester]\nenabled = false\n\
-             [review]\nby = \"reviewer\"\n[plan]\napprove = true\n[limits]\nmax_cost_usd = 2.5\n",
+             [review]\nby = \"reviewer\"\n[plan]\napprove = true\n[finish]\napprove = false\n[limits]\nmax_cost_usd = 2.5\n",
         )
         .unwrap();
         let spec = c.job_spec("j", "g", "/r");
@@ -503,6 +517,7 @@ mod tests {
         assert!(spec.resolve("tester").is_none());
         assert_eq!(spec.review_by, ReviewBy::Reviewer);
         assert_eq!(spec.approve_plan, Some(true));
+        assert_eq!(spec.approve_finish, Some(false));
         assert_eq!(spec.budget.max_cost_usd, Some(2.5));
         assert!(Config::parse("[roles.bad id]\nenabled = false\n").is_err());
     }

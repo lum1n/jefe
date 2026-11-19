@@ -31,11 +31,17 @@ async fn an_embedded_job_streams_values_and_takes_control() {
         .unwrap();
     let mut seen = Vec::new();
     // Approve the plan, then ask for a snapshot and nudge once the worker is
-    // at work, and release it.
+    // at work, and release it; finish once the result waits for review.
+    let mut asks = Vec::new();
     while let Some(m) = job.messages.recv().await {
         if let Message::Ask { ask, kind, .. } = &m {
-            assert_eq!(kind.as_deref(), Some("plan"));
-            job.control.answer(Some(ask.clone()), "approve");
+            asks.push(kind.clone().unwrap_or_default());
+            let text = if kind.as_deref() == Some("finish") {
+                "finish"
+            } else {
+                "approve"
+            };
+            job.control.answer(Some(ask.clone()), text);
         }
         if let Message::Event(s) = &m
             && matches!(s.event, Event::WorkerSpawned { .. })
@@ -52,6 +58,7 @@ async fn an_embedded_job_streams_values_and_takes_control() {
     }
     let report = job.done.await.unwrap().unwrap();
     assert_eq!(report.status, JobStatus::Done);
+    assert_eq!(asks, ["plan", "finish"]);
 
     assert!(
         matches!(&seen[0], Message::Hello { version: 1, job, .. } if job.as_str() == "m1"),

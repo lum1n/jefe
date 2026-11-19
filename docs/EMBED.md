@@ -58,7 +58,7 @@ let effects = jefe.step(input, now_ms);
 | `Follow { worker, host, offset }` | stream the worker's acc log from `offset` as `Input::Bytes`, and its end as `Input::LogEnded` (acc-ssh's `Detached::attach`) |
 | `Unfollow { worker }` | stop that stream |
 | `Consult { ask, situation }` | ask a brain, then send `Input::Decided { ask, decision }` or `Input::BrainFailed { ask, why }`. `RulesBrain.decide(&situation)` answers at once. Only sent with `spec.brain.kind == Rules`: the other kinds launch and drive the orchestrator's own acc session through `Run` and `Follow` (its id is `jefe-<job>-b<n>`; `Follow.worker` then names it). |
-| `AskHuman { ask, question, options, kind }` | eventually send `Input::Human(HumanReply::Answer { … })`. `kind` is `Some("plan")` when the plan waits for approval. |
+| `AskHuman { ask, question, options, kind }` | eventually send `Input::Human(HumanReply::Answer { … })`. `kind` is `Some("plan")` when the plan waits for approval, and `Some("finish")` when the orchestrator says the job is done and the result waits for review (`JobSpec::approve_finish`, default: when attended). Answer `finish` to end the job; any other text goes to the orchestrator as a note and the job goes back to wrap-up. |
 | `Emit(stamped)` | show or store the event |
 | `WakeIn { ms }` | send `Input::Tick` after `ms` |
 | `Finished { status, report }` | done; nothing is left running |

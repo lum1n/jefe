@@ -46,6 +46,7 @@ const WRAP_UP: &str = "You were interrupted because you stopped making progress.
 const CONTINUE: &str = "Your session was restarted. Continue the task where you left off, and end with a \
      ```jefe-result block.";
 const PLAN_KIND: &str = "plan";
+const FINISH_KIND: &str = "finish";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PendingAsk {
@@ -61,7 +62,7 @@ struct HumanAsk {
     /// Questions the worker asked, when the human answers for it.
     #[serde(default)]
     questions: usize,
-    /// `plan` when the plan waits for approval.
+    /// `plan` when the plan waits for approval, `finish` when the result does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
 }
@@ -93,6 +94,9 @@ struct Book {
     merging: Option<TaskId>,
     history: Vec<DecisionView>,
     wrap_asked: bool,
+    /// The summary of a `Done` that waits for the human's review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_finish: Option<String>,
     consults_exhausted: bool,
     /// The orchestrator's session, when it is a harness.
     #[serde(default)]
@@ -244,7 +248,8 @@ impl Jefe {
                     .filter_map(|w| w.deferred.as_ref().map(Deferred::deadline)),
             )
             .chain(brain)
-            .chain([wall])
+            // No wall-clock limit while the result waits for review.
+            .chain((!self.finish_waits()).then_some(wall))
             .min()
     }
 
@@ -2199,7 +2204,16 @@ impl Jefe {
                     ask: ask.clone(),
                     decision: decision.clone(),
                 });
-                self.apply(&pending, decision.action);
+                match decision.action {
+                    Action::Done { summary }
+                        if decision.source != DecisionSource::Human
+                            && self.spec.attended
+                            && self.spec.finish_needs_approval() =>
+                    {
+                        self.ask_finish(summary);
+                    }
+                    action => self.apply(&pending, action),
+                }
             }
             Err(why) => {
                 self.remember(&ask, &pending.trigger, &decision, Some(why.clone()));
@@ -2381,6 +2395,52 @@ impl Jefe {
         }
         q.push_str("Reply `approve` to start, or say what to change.");
         q
+    }
+
+    /// Holds a `Done` back for the human's review while the team and the
+    /// orchestrator's session stay alive.
+    fn ask_finish(&mut self, summary: String) {
+        let question = self.finish_question(&summary);
+        self.book.pending_finish = Some(summary);
+        self.ask_human(
+            Trigger::Wrap,
+            question,
+            vec!["finish".to_owned()],
+            1,
+            Some(FINISH_KIND),
+        );
+    }
+
+    fn finish_question(&self, summary: &str) -> String {
+        let report = self.report(summary.to_owned());
+        let mut q = format!("{}\n", summary.trim());
+        if !report.merged.is_empty() {
+            q.push_str("\nMerged:\n");
+            for m in &report.merged {
+                let commit: String = m.commit.chars().take(7).collect();
+                if commit.is_empty() {
+                    q.push_str(&format!("- {} {}\n", m.task, m.title));
+                } else {
+                    q.push_str(&format!("- {} {} (`{commit}`)\n", m.task, m.title));
+                }
+            }
+        }
+        if !report.branches.is_empty() {
+            q.push_str("\nKept branches:\n");
+            for b in &report.branches {
+                q.push_str(&format!("- `{b}`\n"));
+            }
+        }
+        q.push_str("\nReply `finish` to end the job, or say what else the team should do.");
+        q
+    }
+
+    /// Whether a `Done` waits for the human's review.
+    fn finish_waits(&self) -> bool {
+        self.book
+            .human
+            .as_ref()
+            .is_some_and(|h| h.kind.as_deref() == Some(FINISH_KIND))
     }
 
     // ---- the orchestrator's session -----------------------------------------------
@@ -2936,6 +2996,10 @@ impl Jefe {
                     self.on_plan_answer(&text);
                     return;
                 }
+                if h.kind.as_deref() == Some(FINISH_KIND) {
+                    self.on_finish_answer(&text);
+                    return;
+                }
                 self.job.status = JobStatus::Running;
                 let action = self.human_action(&h, &text);
                 let Some(action) = action else {
@@ -2996,6 +3060,25 @@ impl Jefe {
         self.consult(Trigger::Plan, None);
     }
 
+    /// The human's review of the result: finish, or more work with the
+    /// answer as a note for the orchestrator.
+    fn on_finish_answer(&mut self, text: &str) {
+        let yes = matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "finish" | "done" | "yes" | "y" | "ok" | "lgtm"
+        );
+        let summary = self.book.pending_finish.take();
+        if yes {
+            self.finish(JobStatus::Done, summary.unwrap_or_else(|| "done".to_owned()));
+            return;
+        }
+        self.notice(format!("note from the human: {text}"));
+        self.job.notes.push(text.to_owned());
+        self.job.status = JobStatus::Running;
+        self.book.wrap_asked = true;
+        self.consult(Trigger::Wrap, None);
+    }
+
     /// What a human's free-text answer means for the question it answers.
     fn human_action(&self, h: &HumanAsk, text: &str) -> Option<Action> {
         let trigger = &h.trigger;
@@ -3045,7 +3128,7 @@ impl Jefe {
             return;
         }
         let b = self.spec.budget.clone();
-        if self.now.saturating_sub(self.job.created_ms) > b.wall_ms {
+        if self.now.saturating_sub(self.job.created_ms) > b.wall_ms && !self.finish_waits() {
             self.fail_job(format!(
                 "the job ran past its {} minute limit",
                 b.wall_ms / 60_000
@@ -3214,6 +3297,7 @@ impl Jefe {
         self.book.asks.clear();
         self.book.brain_queue.clear();
         self.book.human = None;
+        self.book.pending_finish = None;
         self.book.merge_queue.clear();
         self.job.status = status;
         let report = self.report(summary.clone());
