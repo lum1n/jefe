@@ -47,6 +47,10 @@ pub struct JobSpec {
     /// `None`: when attended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approve_plan: Option<bool>,
+    /// Wait for the human to review the result before the job ends: a
+    /// `Done` becomes a `finish` ask. `None`: when attended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve_finish: Option<bool>,
     /// Who reviews a task's diff.
     #[serde(default)]
     pub review_by: ReviewBy,
@@ -80,6 +84,7 @@ impl JobSpec {
             budget: Budget::default(),
             attended: false,
             approve_plan: None,
+            approve_finish: None,
             review_by: ReviewBy::default(),
             allow_dirty: false,
             squash: false,
@@ -92,6 +97,11 @@ impl JobSpec {
     /// The plan waits for a human's approval.
     pub fn plan_needs_approval(&self) -> bool {
         self.approve_plan.unwrap_or(self.attended)
+    }
+
+    /// The result waits for a human's review before the job ends.
+    pub fn finish_needs_approval(&self) -> bool {
+        self.approve_finish.unwrap_or(self.attended)
     }
 
     /// The role `id`: the job's own, else a built-in one.
@@ -778,6 +788,7 @@ mod tests {
         assert_eq!(spec.brain.kind, BrainKind::Rules);
         assert_eq!(spec.review_by, ReviewBy::Both);
         assert!(!spec.plan_needs_approval());
+        assert!(!spec.finish_needs_approval());
         let task: TaskSpec = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
         assert_eq!(task.role, DEFAULT_ROLE);
     }

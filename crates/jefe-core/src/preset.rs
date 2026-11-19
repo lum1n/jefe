@@ -24,6 +24,8 @@ pub struct TeamPreset {
     pub budget: BudgetPreset,
     /// `None`: when attended.
     pub approve_plan: Option<bool>,
+    /// Review the result before the job ends. `None`: when attended.
+    pub approve_finish: Option<bool>,
     pub review_by: ReviewBy,
 }
 
@@ -117,6 +119,7 @@ impl Default for TeamPreset {
             roles: BTreeMap::new(),
             budget: BudgetPreset::default(),
             approve_plan: None,
+            approve_finish: None,
             review_by: ReviewBy::default(),
         }
     }
@@ -152,6 +155,7 @@ impl TeamPreset {
             ]),
             budget: BudgetPreset::default(),
             approve_plan: None,
+            approve_finish: None,
             review_by: ReviewBy::Both,
         }
     }
@@ -199,6 +203,7 @@ impl TeamPreset {
         spec.budget.wall_ms = self.budget.wall_minutes.saturating_mul(60_000);
         spec.budget.max_cost_usd = self.budget.max_cost_usd;
         spec.approve_plan = self.approve_plan;
+        spec.approve_finish = self.approve_finish;
         spec.review_by = self.review_by;
     }
 

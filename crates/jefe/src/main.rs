@@ -57,6 +57,13 @@ struct RunArgs {
     /// Start workers without showing you the plan first.
     #[arg(long)]
     no_approval: bool,
+    /// Wait for your review of the result before the job ends (default:
+    /// when attended).
+    #[arg(long, conflicts_with = "no_approve_finish")]
+    approve_finish: bool,
+    /// End the job as soon as the orchestrator says it is done.
+    #[arg(long)]
+    no_approve_finish: bool,
     /// Keep the job's state on its host too, with a lease, so another
     /// client (a desktop, a phone) can pick it up.
     #[arg(long, value_enum, default_value_t = StateMode::Local)]
@@ -302,6 +309,11 @@ fn run_job(a: RunArgs) -> anyhow::Result<i32> {
         spec.approve_plan = Some(true);
     } else if a.no_approval {
         spec.approve_plan = Some(false);
+    }
+    if a.approve_finish {
+        spec.approve_finish = Some(true);
+    } else if a.no_approve_finish {
+        spec.approve_finish = Some(false);
     }
     spec.attended = !a.unattended && (a.json || std::io::stdin().is_terminal());
     let attended = spec.attended;

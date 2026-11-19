@@ -16,6 +16,7 @@ jefe "..." --json --unattended         # NDJSON for programs; never waits on a h
 jefe "..." --brain session             # a model orchestrates, in one session for the whole job
 jefe "..." --brain oneshot             # a fresh session per judgment point
 jefe "..." --approve-plan              # show you the plan first (default when attended)
+jefe "..." --no-approve-finish         # end as soon as the orchestrator says done (default: you review the result when attended)
 jefe "..." --state host                # keep the job's state on the host too, with a lease
 jefe "..." --host box --repo /src/proj # workers on [hosts.box], over SSH
 jefe status [JOB] [--json] [--live]    # the latest job by default; --live follows it

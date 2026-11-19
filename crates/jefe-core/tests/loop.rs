@@ -1142,6 +1142,7 @@ fn a_disabled_role_in_a_plan_is_refused() {
 fn an_attended_job_waits_for_the_plan_to_be_approved() {
     let mut s = spec();
     s.attended = true;
+    s.approve_finish = Some(false);
     let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
     h.drain();
     assert_eq!(h.jefe.job().status, JobStatus::AwaitingApproval);
@@ -1182,10 +1183,166 @@ fn approval_can_be_turned_off_for_attended_jobs() {
     let mut s = spec();
     s.attended = true;
     s.approve_plan = Some(false);
+    s.approve_finish = Some(false);
     let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
     h.drain();
     assert!(h.human_asks.is_empty());
     assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+// ---- the finish gate ----------------------------------------------------------------
+
+/// An attended job that skips the plan's approval, so it runs to its end.
+fn finish_spec() -> JobSpec {
+    let mut s = spec();
+    s.attended = true;
+    s.approve_plan = Some(false);
+    s
+}
+
+fn finish_asks(h: &Host) -> usize {
+    h.events
+        .iter()
+        .filter(|e| matches!(e, Event::HumanAsked { kind: Some(k), .. } if k == "finish"))
+        .count()
+}
+
+fn answer(h: &mut Host, text: &str) {
+    h.feed(Input::Human(HumanReply::Answer {
+        ask: None,
+        text: text.to_owned(),
+    }));
+    h.drain();
+}
+
+#[test]
+fn an_attended_job_asks_before_it_finishes_and_finish_ends_it() {
+    let mut h =
+        Host::new(finish_spec(), Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(h.finished, None, "{:?}", h.kinds());
+    assert!(!h.has("job_done"));
+    assert_eq!(finish_asks(&h), 1, "{:?}", h.kinds());
+    assert_eq!(h.jefe.job().status, JobStatus::NeedsHuman);
+    let q = h.human_asks.last().unwrap();
+    assert!(q.contains("Added hello.txt"), "{q}");
+    assert!(q.contains("t1") && q.contains("c0ffee"), "{q}");
+    assert!(q.contains("`finish`"), "{q}");
+    answer(&mut h, "finish");
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+    match h.events.iter().rev().find(|e| matches!(e, Event::JobDone { .. })) {
+        Some(Event::JobDone { summary, merged, .. }) => {
+            assert!(summary.contains("Added hello.txt"), "{summary}");
+            assert_eq!(merged.len(), 1);
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn a_note_at_the_finish_gate_sends_the_job_back_to_wrap_up() {
+    use jefe_core::job::TaskSpec;
+    let mut h = Host::new(finish_spec(), Box::new(RulesBrain))
+        .script(1, vec![fixture("worker-reports.ndjson")])
+        .script(2, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 1);
+    let consults_before = h.kinds().iter().filter(|k| *k == "consulted").count();
+    // The orchestrator plans one more task on the note.
+    h.brain = Box::new(FakeBrain(VecDeque::from([Action::Plan {
+        tasks: vec![TaskSpec::new("Readme", "Add a README")],
+    }])));
+    answer(&mut h, "add a README too");
+    assert_eq!(h.jefe.job().notes, vec!["add a README too".to_owned()]);
+    let consults = h.kinds().iter().filter(|k| *k == "consulted").count();
+    assert!(consults > consults_before, "{:?}", h.kinds());
+    let job = h.jefe.job();
+    assert_eq!(job.tasks.len(), 2, "{:?}", h.kinds());
+    assert!(
+        job.tasks.iter().all(|t| t.status == TaskStatus::Merged),
+        "{:?}",
+        h.kinds()
+    );
+    // The next done is gated again.
+    assert_eq!(finish_asks(&h), 2, "{:?}", h.kinds());
+    assert_eq!(h.finished, None);
+    answer(&mut h, "lgtm");
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+    match h.events.last() {
+        Some(Event::JobDone { merged, .. }) => assert_eq!(merged.len(), 2),
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn the_finish_gate_can_be_turned_off_and_never_holds_unattended_jobs() {
+    let mut s = finish_spec();
+    s.approve_finish = Some(false);
+    let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 0);
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+
+    let mut s = spec();
+    s.approve_finish = Some(true);
+    let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 0);
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+}
+
+#[test]
+fn the_finish_gate_keeps_the_orchestrator_session_alive() {
+    let mut s = session_spec();
+    s.attended = true;
+    s.approve_plan = Some(false);
+    let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.brain_script = VecDeque::from([
+        brain_turn(
+            r#"{"action":"plan","tasks":[{"title":"Add hello","brief":"Add hello.txt"}]}"#,
+            true,
+        ),
+        brain_turn(r#"{"action":"accept","task":"t1"}"#, false),
+        brain_turn(r#"{"action":"done","summary":"hello landed"}"#, false),
+    ]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 1, "{:?}", h.kinds());
+    assert!(h.jefe.brain_session().is_some());
+    assert!(
+        !h.runs.iter().any(|p| matches!(p, Purpose::BrainKill(_))),
+        "{:?}",
+        h.runs
+    );
+    answer(&mut h, "finish");
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+    match h.events.iter().rev().find(|e| matches!(e, Event::JobDone { .. })) {
+        Some(Event::JobDone { summary, .. }) => assert_eq!(summary, "hello landed"),
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn the_finish_gate_survives_a_restart_and_the_wall_clock() {
+    let mut s = finish_spec();
+    s.budget.wall_ms = 100_000;
+    let mut h = Host::new(s, Box::new(RulesBrain)).script(1, vec![fixture("worker-reports.ndjson")]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 1);
+    restart(&mut h, &[]);
+    h.drain();
+    assert_eq!(finish_asks(&h), 1, "the restart re-asks without a new event");
+    // Past the wall-clock limit while the result waits: nothing fails.
+    assert!(h.jefe.next_deadline().is_none_or(|d| d > h.now + 1_000_000));
+    h.now += 1_000_000;
+    h.feed(Input::Tick);
+    h.drain();
+    assert_eq!(h.finished, None, "{:?}", h.kinds());
+    answer(&mut h, "finish");
+    assert_eq!(h.finished, Some(JobStatus::Done), "{:?}", h.kinds());
+    match h.events.last() {
+        Some(Event::JobDone { summary, .. }) => assert!(summary.contains("Added hello.txt"), "{summary}"),
+        e => panic!("{e:?}"),
+    }
 }
 
 // ---- the orchestrator as a session --------------------------------------------------
