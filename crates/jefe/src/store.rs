@@ -243,6 +243,7 @@ mod tests {
             events: File::create(dir.join("events.ndjson")).unwrap(),
             inputs: File::create(dir.join("inputs.ndjson")).unwrap(),
             dir: dir.clone(),
+            mirror: true,
         };
         store.worker_final("w1", "first").unwrap();
         let path = dir.join("workers/w1/final.md");
