@@ -46,6 +46,8 @@ pub struct Hosted {
     leasing: bool,
     lease_lost: bool,
     released: bool,
+    /// The release came back from the host (the lease file is gone).
+    release_done: bool,
     finished: bool,
     now: u64,
 }
@@ -100,6 +102,7 @@ impl Hosted {
             leasing: false,
             lease_lost: false,
             released: false,
+            release_done: false,
             finished: false,
             now: now_ms,
         }
@@ -118,9 +121,10 @@ impl Hosted {
         self.lease_lost
     }
 
-    /// The job is over and its last save and release were issued.
+    /// The job is over and its last save and release are done: a driver
+    /// that stops before the release came back could leave the lease behind.
     pub fn is_finished(&self) -> bool {
-        self.jefe.is_finished() && (!self.hosted || self.released)
+        self.jefe.is_finished() && (!self.hosted || self.release_done)
     }
 
     pub fn snapshot(&self) -> String {
@@ -211,7 +215,8 @@ impl Hosted {
                     _ => {}
                 }
             }
-            Own::Final | Own::Release => {}
+            Own::Release => self.release_done = true,
+            Own::Final => {}
         }
         Vec::new()
     }
